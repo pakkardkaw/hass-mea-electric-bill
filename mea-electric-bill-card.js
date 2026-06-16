@@ -63,27 +63,63 @@ function getCycleStart(cutoffDay, now) {
   return start;
 }
 
-async function fetchUsage(hass, entityId, start, end) {
-  if (!entityId) return 0;
+// MEA residential TOU schedule: on-peak is Mon-Fri 09:00-22:00; everything else
+// (nights, and all day Sat/Sun) is off-peak. Public holidays are also off-peak
+// under MEA's actual rules, but aren't accounted for here since HA has no
+// built-in Thai holiday calendar - see README for the limitation.
+function isOnPeak(date) {
+  const day = date.getDay(); // 0 = Sunday, 6 = Saturday
+  if (day === 0 || day === 6) return false;
+  const hour = date.getHours();
+  return hour >= 9 && hour < 22;
+}
+
+async function fetchSeries(hass, entityId, start, end) {
+  if (!entityId) return [];
   const path = `history/period/${start.toISOString()}?filter_entity_id=${entityId}&end_time=${end.toISOString()}&minimal_response`;
   let series;
   try {
     series = await hass.callApi("GET", path);
   } catch (err) {
-    return null;
+    return [];
   }
-  if (!series || !series[0] || !series[0].length) return 0;
-  const points = series[0]
-    .map((p) => parseFloat(p.state))
-    .filter((v) => !Number.isNaN(v));
+  if (!series || !series[0]) return [];
+  return series[0]
+    .map((p) => ({
+      time: new Date(p.last_changed),
+      value: parseFloat(p.state),
+    }))
+    .filter((p) => !Number.isNaN(p.value))
+    .sort((a, b) => a.time - b.time);
+}
+
+function totalUsage(points) {
   if (!points.length) return 0;
-  const first = points[0];
-  const last = points[points.length - 1];
+  const first = points[0].value;
+  const last = points[points.length - 1].value;
   if (last < first) {
     // meter likely reset mid-cycle; best effort: count from zero
     return last;
   }
   return last - first;
+}
+
+// Splits a single cumulative-energy series into on-peak / off-peak totals by
+// classifying each delta between consecutive readings using the timestamp of
+// the start of that interval.
+function splitUsageByPeak(points) {
+  let onPeak = 0;
+  let offPeak = 0;
+  for (let i = 1; i < points.length; i++) {
+    let delta = points[i].value - points[i - 1].value;
+    if (delta < 0) delta = points[i].value; // meter reset mid-cycle
+    if (isOnPeak(points[i - 1].time)) {
+      onPeak += delta;
+    } else {
+      offPeak += delta;
+    }
+  }
+  return { onPeak, offPeak };
 }
 
 class MeaElectricBillCard extends HTMLElement {
@@ -111,11 +147,8 @@ class MeaElectricBillCard extends HTMLElement {
       throw new Error('scheme must be "normal" or "tou"');
     }
     const entities = config.entities || {};
-    if (scheme === "normal" && !entities.total) {
-      throw new Error("entities.total is required for the normal (bucket) scheme");
-    }
-    if (scheme === "tou" && (!entities.on_peak || !entities.off_peak)) {
-      throw new Error("entities.on_peak and entities.off_peak are required for the TOU scheme");
+    if (!entities.total) {
+      throw new Error("entities.total (your cumulative energy sensor) is required");
     }
     const cutoffDay = Number(config.cutoff_day || 1);
     if (cutoffDay < 1 || cutoffDay > 31) {
@@ -157,13 +190,11 @@ class MeaElectricBillCard extends HTMLElement {
     const now = new Date();
     const start = getCycleStart(cfg.cutoff_day, now);
 
+    const points = await fetchSeries(this._hass, cfg.entities.total, start, now);
     if (cfg.scheme === "normal") {
-      const units = await fetchUsage(this._hass, cfg.entities.total, start, now);
-      this._usage = { units };
+      this._usage = { units: totalUsage(points) };
     } else {
-      const onPeak = await fetchUsage(this._hass, cfg.entities.on_peak, start, now);
-      const offPeak = await fetchUsage(this._hass, cfg.entities.off_peak, start, now);
-      this._usage = { onPeak, offPeak };
+      this._usage = splitUsageByPeak(points);
     }
     this._cycleStart = start;
     this._render();
@@ -314,6 +345,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
         input, select { padding: 6px; border-radius: 4px; border: 1px solid var(--divider-color); background: var(--card-background-color); color: var(--primary-text-color); }
         .two-col { display: flex; gap: 12px; }
         .two-col .row { flex: 1; }
+        .row.hint { font-size: 0.8em; color: var(--secondary-text-color); margin-top: -4px; }
       </style>
       <div class="row">
         <label>Name</label>
@@ -340,19 +372,17 @@ class MeaElectricBillCardEditor extends HTMLElement {
                 <option value="1.1" ${cfg.tariff_class === "1.1" ? "selected" : ""}>1.1 - ≤150 units/month</option>
                 <option value="1.2" ${cfg.tariff_class === "1.2" ? "selected" : ""}>1.2 - &gt;150 units/month</option>
               </select>
-            </div>
-            <div class="row">
-              <label>Total energy sensor (cumulative kWh)</label>
-              <ha-entity-picker id="entity_total"></ha-entity-picker>
             </div>`
-          : `<div class="row">
-              <label>On-peak energy sensor (cumulative kWh)</label>
-              <ha-entity-picker id="entity_on_peak"></ha-entity-picker>
-            </div>
-            <div class="row">
-              <label>Off-peak energy sensor (cumulative kWh)</label>
-              <ha-entity-picker id="entity_off_peak"></ha-entity-picker>
-            </div>`
+          : ""
+      }
+      <div class="row">
+        <label>Total energy sensor (cumulative kWh)</label>
+        <ha-entity-picker id="entity_total"></ha-entity-picker>
+      </div>
+      ${
+        isTou
+          ? `<div class="row hint">On-peak/off-peak usage is split automatically from this single sensor based on time of day and day of week (Mon-Fri 09:00-22:00 = on-peak).</div>`
+          : ""
       }
       <div class="two-col">
         <div class="row">
@@ -382,31 +412,14 @@ class MeaElectricBillCardEditor extends HTMLElement {
       $("tariff_class").addEventListener("change", (e) =>
         this._valueChanged(["tariff_class"], e.target.value)
       );
-      const totalPicker = $("entity_total");
-      if (totalPicker) {
-        totalPicker.hass = this._hass;
-        totalPicker.value = cfg.entities.total || "";
-        totalPicker.addEventListener("value-changed", (e) =>
-          this._valueChanged(["entities", "total"], e.detail.value)
-        );
-      }
-    } else {
-      const onPicker = $("entity_on_peak");
-      const offPicker = $("entity_off_peak");
-      if (onPicker) {
-        onPicker.hass = this._hass;
-        onPicker.value = cfg.entities.on_peak || "";
-        onPicker.addEventListener("value-changed", (e) =>
-          this._valueChanged(["entities", "on_peak"], e.detail.value)
-        );
-      }
-      if (offPicker) {
-        offPicker.hass = this._hass;
-        offPicker.value = cfg.entities.off_peak || "";
-        offPicker.addEventListener("value-changed", (e) =>
-          this._valueChanged(["entities", "off_peak"], e.detail.value)
-        );
-      }
+    }
+    const totalPicker = $("entity_total");
+    if (totalPicker) {
+      totalPicker.hass = this._hass;
+      totalPicker.value = cfg.entities.total || "";
+      totalPicker.addEventListener("value-changed", (e) =>
+        this._valueChanged(["entities", "total"], e.detail.value)
+      );
     }
   }
 }

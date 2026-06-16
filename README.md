@@ -11,8 +11,10 @@ MEA residential rate schemes and a per-user billing cutoff day.
 - **Normal (tiered / bucket) rate** — select a single cumulative energy sensor
   (kWh) and the card applies MEA's tiered/bucket pricing (type 1.1 ≤150
   units/month, or type 1.2 >150 units/month).
-- **TOU (Time of Use) rate** — select separate on-peak and off-peak cumulative
-  energy sensors and the card applies MEA's on-peak/off-peak unit rates.
+- **TOU (Time of Use) rate** — select your single cumulative energy sensor;
+  the card automatically splits usage into on-peak/off-peak based on the
+  timestamp of each reading (Mon-Fri 09:00-22:00 = on-peak, everything else
+  off-peak) and applies MEA's on-peak/off-peak unit rates.
 - **Custom billing cutoff day** — set the day of the month your bill cycle
   resets (1–31); usage is calculated from the most recent cutoff to now.
 - Includes the Ft (fuel adjustment) charge and VAT in the estimate.
@@ -52,9 +54,13 @@ cutoff_day: 5
 ft_satang: 0
 vat: 7
 entities:
-  on_peak: sensor.atmoce_grid_energy_on_peak    # cumulative kWh, on-peak
-  off_peak: sensor.atmoce_grid_energy_off_peak  # cumulative kWh, off-peak
+  total: sensor.atmoce_grid_energy_total   # same single cumulative kWh sensor
 ```
+
+On-peak/off-peak split is derived automatically from the timestamps of the
+sensor's history (Mon-Fri 09:00-22:00 = on-peak; nights and all day Sat/Sun =
+off-peak). Thai public holidays (which MEA also bills as off-peak) aren't
+accounted for, since Home Assistant has no built-in Thai holiday calendar.
 
 ### Overriding rates
 
