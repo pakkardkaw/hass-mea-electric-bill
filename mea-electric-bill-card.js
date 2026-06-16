@@ -299,7 +299,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    this._render();
+    if (this._config) this._render();
   }
 
   _emit() {
@@ -334,6 +334,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
   }
 
   _render() {
+    if (!this._config) return;
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     const cfg = this._config;
     const isTou = cfg.scheme === "tou";
