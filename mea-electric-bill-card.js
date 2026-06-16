@@ -294,12 +294,30 @@ class MeaElectricBillCard extends HTMLElement {
 class MeaElectricBillCardEditor extends HTMLElement {
   setConfig(config) {
     this._config = { ...MeaElectricBillCard.getStubConfig(), ...config };
+    this._rates = structuredClone(DEFAULT_RATES);
+    this._mergeRates(config.rates);
     this._render();
   }
 
   set hass(hass) {
     this._hass = hass;
     if (this._config) this._render();
+  }
+
+  _mergeRates(rates) {
+    if (!rates) return;
+    if (rates.normal) {
+      for (const cls of Object.keys(rates.normal)) {
+        if (!this._rates.normal[cls]) continue;
+        Object.assign(this._rates.normal[cls], rates.normal[cls]);
+        if (rates.normal[cls].tiers) {
+          this._rates.normal[cls].tiers = rates.normal[cls].tiers.map((t) => ({ ...t }));
+        }
+      }
+    }
+    if (rates.tou) {
+      Object.assign(this._rates.tou, rates.tou);
+    }
   }
 
   _emit() {
@@ -324,13 +342,13 @@ class MeaElectricBillCardEditor extends HTMLElement {
     this._render();
   }
 
-  _entityPickerRow(label, key) {
-    return `
-      <div class="row">
-        <label>${label}</label>
-        <ha-entity-picker data-key="${key}" .hass=${"hass"} allow-custom-entity></ha-entity-picker>
-      </div>
-    `;
+  _rateChanged(path, value) {
+    let obj = this._rates;
+    for (let i = 0; i < path.length - 1; i++) obj = obj[path[i]];
+    obj[path[path.length - 1]] = value;
+    this._config = { ...this._config, rates: structuredClone(this._rates) };
+    this._emit();
+    this._render();
   }
 
   _render() {
@@ -338,6 +356,50 @@ class MeaElectricBillCardEditor extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
     const cfg = this._config;
     const isTou = cfg.scheme === "tou";
+    const normalRates = this._rates.normal[cfg.tariff_class];
+    const touRates = this._rates.tou;
+
+    const ratesSection = !isTou
+      ? `
+        <div class="rates-box">
+          <div class="rates-title">Energy charge rates (${normalRates.label})</div>
+          <div class="two-col">
+            <div class="row">
+              <label>Service charge (฿/month)</label>
+              <input id="normal_service_charge" type="number" step="0.01" value="${normalRates.serviceCharge}" />
+            </div>
+          </div>
+          ${normalRates.tiers
+            .map((tier, i) => {
+              const prevLimit = i === 0 ? 0 : normalRates.tiers[i - 1].upTo;
+              const label = tier.upTo === Infinity ? `Over ${prevLimit} units` : `${prevLimit + 1}-${tier.upTo} units`;
+              return `<div class="row tier-row">
+                <label>${label} (฿/unit)</label>
+                <input class="tier-rate" data-idx="${i}" type="number" step="0.0001" value="${tier.rate}" />
+              </div>`;
+            })
+            .join("")}
+        </div>`
+      : `
+        <div class="rates-box">
+          <div class="rates-title">TOU rates</div>
+          <div class="two-col">
+            <div class="row">
+              <label>Service charge (฿/month)</label>
+              <input id="tou_service_charge" type="number" step="0.01" value="${touRates.serviceCharge}" />
+            </div>
+          </div>
+          <div class="two-col">
+            <div class="row">
+              <label>On-peak rate (฿/unit)</label>
+              <input id="tou_on_peak_rate" type="number" step="0.0001" value="${touRates.onPeakRate}" />
+            </div>
+            <div class="row">
+              <label>Off-peak rate (฿/unit)</label>
+              <input id="tou_off_peak_rate" type="number" step="0.0001" value="${touRates.offPeakRate}" />
+            </div>
+          </div>
+        </div>`;
 
     this.shadowRoot.innerHTML = `
       <style>
@@ -347,6 +409,9 @@ class MeaElectricBillCardEditor extends HTMLElement {
         .two-col { display: flex; gap: 12px; }
         .two-col .row { flex: 1; }
         .row.hint { font-size: 0.8em; color: var(--secondary-text-color); margin-top: -4px; }
+        .rates-box { border: 1px solid var(--divider-color); border-radius: 8px; padding: 12px; margin: 8px 0 12px; }
+        .rates-title { font-weight: 500; margin-bottom: 8px; }
+        .tier-row input { max-width: 140px; }
       </style>
       <div class="row">
         <label>Name</label>
@@ -395,6 +460,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
           <input id="vat" type="number" step="0.1" value="${cfg.vat}" />
         </div>
       </div>
+      ${ratesSection}
     `;
 
     const $ = (id) => this.shadowRoot.getElementById(id);
@@ -412,6 +478,27 @@ class MeaElectricBillCardEditor extends HTMLElement {
     if (!isTou) {
       $("tariff_class").addEventListener("change", (e) =>
         this._valueChanged(["tariff_class"], e.target.value)
+      );
+      $("normal_service_charge").addEventListener("change", (e) =>
+        this._rateChanged(["normal", cfg.tariff_class, "serviceCharge"], Number(e.target.value))
+      );
+      this.shadowRoot.querySelectorAll(".tier-rate").forEach((input) => {
+        input.addEventListener("change", (e) =>
+          this._rateChanged(
+            ["normal", cfg.tariff_class, "tiers", Number(e.target.dataset.idx), "rate"],
+            Number(e.target.value)
+          )
+        );
+      });
+    } else {
+      $("tou_service_charge").addEventListener("change", (e) =>
+        this._rateChanged(["tou", "serviceCharge"], Number(e.target.value))
+      );
+      $("tou_on_peak_rate").addEventListener("change", (e) =>
+        this._rateChanged(["tou", "onPeakRate"], Number(e.target.value))
+      );
+      $("tou_off_peak_rate").addEventListener("change", (e) =>
+        this._rateChanged(["tou", "offPeakRate"], Number(e.target.value))
       );
     }
     const totalPicker = $("entity_total");
