@@ -448,8 +448,12 @@ class MeaElectricBillCardEditor extends HTMLElement {
   }
 
   set hass(hass) {
+    // Only re-render on the first hass assignment: hass updates fire
+    // continuously (every state change in the system), and rebuilding the
+    // form's innerHTML on each one would wipe out in-progress typing/focus.
+    const firstHass = !this._hass;
     this._hass = hass;
-    if (this._config) this._render();
+    if (this._config && firstHass) this._render();
   }
 
   _mergeRates(rates) {
