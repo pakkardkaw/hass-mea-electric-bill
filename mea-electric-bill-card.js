@@ -602,7 +602,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
       }
       <div class="row">
         <label>Total energy sensor (cumulative kWh)</label>
-        <ha-entity-picker id="entity_total"></ha-entity-picker>
+        <input id="entity_total" type="text" list="sensor-options" value="${cfg.entities.total || ""}" placeholder="sensor.your_grid_energy_total" />
       </div>
       ${
         isTou
@@ -611,12 +611,15 @@ class MeaElectricBillCardEditor extends HTMLElement {
       }
       <div class="row">
         <label>PV energy total sensor (optional, cumulative kWh)</label>
-        <ha-entity-picker id="entity_pv_total"></ha-entity-picker>
+        <input id="entity_pv_total" type="text" list="sensor-options" value="${cfg.entities.pv_total || ""}" placeholder="sensor.your_pv_energy_total" />
       </div>
       <div class="row">
         <label>PV self consumption rate sensor (optional, %)</label>
-        <ha-entity-picker id="entity_pv_self_consumption_rate"></ha-entity-picker>
+        <input id="entity_pv_self_consumption_rate" type="text" list="sensor-options" value="${cfg.entities.pv_self_consumption_rate || ""}" placeholder="sensor.your_pv_self_consumption_rate" />
       </div>
+      <datalist id="sensor-options">
+        ${this._sensorOptions()}
+      </datalist>
       <div class="row hint">If set, the card shows how much these saved you (PV Energy Total × Self Consumption Rate, valued at the on/off-peak time it was generated).</div>
       <div class="two-col">
         <div class="row">
@@ -672,20 +675,25 @@ class MeaElectricBillCardEditor extends HTMLElement {
         this._rateChanged(["tou", "offPeakRate"], Number(e.target.value))
       );
     }
-    const pickerSpecs = [
+    const entityFields = [
       ["entity_total", "total"],
       ["entity_pv_total", "pv_total"],
       ["entity_pv_self_consumption_rate", "pv_self_consumption_rate"],
     ];
-    for (const [elemId, key] of pickerSpecs) {
-      const picker = $(elemId);
-      if (!picker) continue;
-      picker.hass = this._hass;
-      picker.value = cfg.entities[key] || "";
-      picker.addEventListener("value-changed", (e) =>
-        this._valueChanged(["entities", key], e.detail.value)
-      );
+    for (const [elemId, key] of entityFields) {
+      const field = $(elemId);
+      if (!field) continue;
+      field.addEventListener("change", (e) => this._valueChanged(["entities", key], e.target.value));
     }
+  }
+
+  _sensorOptions() {
+    if (!this._hass) return "";
+    return Object.keys(this._hass.states)
+      .filter((id) => id.startsWith("sensor."))
+      .sort()
+      .map((id) => `<option value="${id}"></option>`)
+      .join("");
   }
 }
 
