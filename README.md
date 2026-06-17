@@ -54,6 +54,16 @@ entities:
   pv_self_consumption_rate: sensor.atmoce_pv_self_consumption_rate  # optional, %
 ```
 
+If you have more than one grid meter, `entities.total` also accepts a list and
+sums their usage together:
+
+```yaml
+entities:
+  total:
+    - sensor.atmoce_grid_energy_total_a
+    - sensor.atmoce_grid_energy_total_b
+```
+
 ### TOU scheme
 
 ```yaml

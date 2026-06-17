@@ -177,6 +177,11 @@ function splitSelfConsumedByPeak(pvPoints, ratePoints) {
   return { onPeak, offPeak };
 }
 
+function toArray(v) {
+  if (!v) return [];
+  return Array.isArray(v) ? v.filter(Boolean) : [v];
+}
+
 class MeaElectricBillCard extends HTMLElement {
   static getConfigElement() {
     return document.createElement("mea-electric-bill-card-editor");
@@ -203,8 +208,8 @@ class MeaElectricBillCard extends HTMLElement {
       throw new Error('scheme must be "normal" or "tou"');
     }
     const entities = config.entities || {};
-    if (!entities.total) {
-      throw new Error("entities.total (your cumulative energy sensor) is required");
+    if (!toArray(entities.total).length) {
+      throw new Error("entities.total (at least one cumulative energy sensor) is required");
     }
     const cutoffDay = Number(config.cutoff_day || 1);
     if (cutoffDay < 1 || cutoffDay > 31) {
@@ -255,11 +260,20 @@ class MeaElectricBillCard extends HTMLElement {
     const now = new Date();
     const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
 
-    const points = await fetchSeries(this._hass, cfg.entities.total, start, now);
+    const totalEntities = toArray(cfg.entities.total);
+    const pointsPerEntity = await Promise.all(
+      totalEntities.map((id) => fetchSeries(this._hass, id, start, now))
+    );
     if (cfg.scheme === "normal") {
-      this._usage = { units: totalUsage(points) };
+      this._usage = { units: pointsPerEntity.reduce((sum, pts) => sum + totalUsage(pts), 0) };
     } else {
-      this._usage = splitUsageByPeak(points);
+      this._usage = pointsPerEntity.reduce(
+        (acc, pts) => {
+          const split = splitUsageByPeak(pts);
+          return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
+        },
+        { onPeak: 0, offPeak: 0 }
+      );
     }
 
     if (cfg.entities.pv_total) {
@@ -561,6 +575,26 @@ class MeaElectricBillCardEditor extends HTMLElement {
         .two-col { display: flex; gap: 12px; }
         .two-col .row { flex: 1; }
         .row.hint { font-size: 0.8em; color: var(--secondary-text-color); margin-top: -4px; }
+        .entity-row { display: flex; gap: 6px; margin-bottom: 6px; }
+        .entity-row input { flex: 1; }
+        .remove-total {
+          border: 1px solid var(--divider-color);
+          background: var(--card-background-color);
+          color: var(--primary-text-color);
+          border-radius: 4px;
+          cursor: pointer;
+          padding: 0 10px;
+        }
+        .add-total {
+          align-self: flex-start;
+          border: 1px dashed var(--divider-color);
+          background: none;
+          color: var(--primary-color);
+          border-radius: 4px;
+          cursor: pointer;
+          padding: 6px 10px;
+          margin-bottom: 4px;
+        }
         .rates-box { border: 1px solid var(--divider-color); border-radius: 8px; padding: 12px; margin: 8px 0 12px; }
         .rates-title { font-weight: 500; margin-bottom: 8px; }
         .tier-row input { max-width: 140px; }
@@ -605,8 +639,18 @@ class MeaElectricBillCardEditor extends HTMLElement {
           : ""
       }
       <div class="row">
-        <label>Total energy sensor (cumulative kWh)</label>
-        <input id="entity_total" type="text" list="sensor-options" value="${cfg.entities.total || ""}" placeholder="sensor.your_grid_energy_total" />
+        <label>Total energy sensor(s) (cumulative kWh)</label>
+        ${this._totalEntities()
+          .map(
+            (id, i) => `
+          <div class="entity-row">
+            <input class="entity-total" data-idx="${i}" type="text" list="sensor-options" value="${id}" placeholder="sensor.your_grid_energy_total" />
+            <button class="remove-total" data-idx="${i}" title="Remove">✕</button>
+          </div>`
+          )
+          .join("")}
+        <button class="add-total" type="button">+ Add another sensor</button>
+        <div class="row hint">Add more than one if you have multiple grid meters; their usage is summed together.</div>
       </div>
       ${
         isTou
@@ -680,7 +724,6 @@ class MeaElectricBillCardEditor extends HTMLElement {
       );
     }
     const entityFields = [
-      ["entity_total", "total"],
       ["entity_pv_total", "pv_total"],
       ["entity_pv_self_consumption_rate", "pv_self_consumption_rate"],
     ];
@@ -689,6 +732,39 @@ class MeaElectricBillCardEditor extends HTMLElement {
       if (!field) continue;
       field.addEventListener("change", (e) => this._valueChanged(["entities", key], e.target.value));
     }
+
+    this.shadowRoot.querySelectorAll(".entity-total").forEach((input) => {
+      input.addEventListener("change", (e) => {
+        const list = this._totalEntities();
+        list[Number(e.target.dataset.idx)] = e.target.value;
+        this._setTotalEntities(list);
+      });
+    });
+    this.shadowRoot.querySelectorAll(".remove-total").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const list = this._totalEntities();
+        list.splice(Number(btn.dataset.idx), 1);
+        this._setTotalEntities(list.length ? list : [""]);
+      });
+    });
+    const addBtn = this.shadowRoot.querySelector(".add-total");
+    if (addBtn) {
+      addBtn.addEventListener("click", () => {
+        this._setTotalEntities([...this._totalEntities(), ""]);
+      });
+    }
+  }
+
+  _totalEntities() {
+    const list = toArray(this._config.entities.total);
+    return list.length ? [...list] : [""];
+  }
+
+  _setTotalEntities(list) {
+    const cfg = { ...this._config, entities: { ...this._config.entities, total: list } };
+    this._config = cfg;
+    this._emit();
+    this._render();
   }
 
   _sensorOptions() {
