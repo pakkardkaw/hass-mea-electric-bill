@@ -17,6 +17,9 @@ MEA residential rate schemes and a per-user billing cutoff day.
   off-peak) and applies MEA's on-peak/off-peak unit rates.
 - **Custom billing cutoff day** — set the day of the month your bill cycle
   resets (1–31); usage is calculated from the most recent cutoff to now.
+- **Day / Week / Month / Bill cycle toggle** — switch the view directly on the
+  card to see cost for today, this week (Mon-Sun), this calendar month, or
+  the current billing cycle.
 - Includes the Ft (fuel adjustment) charge and VAT in the estimate.
 - Visual editor in the Lovelace UI — no YAML required.
 - Optional solar savings — set a PV Energy Total sensor and a PV Self
@@ -42,6 +45,7 @@ name: Electric Bill
 scheme: normal
 tariff_class: "1.2"        # "1.1" (≤150 units/month) or "1.2" (>150 units/month)
 cutoff_day: 5               # your bill cycle reset day, 1-31
+default_period: cycle        # day | week | month | cycle (default tab shown)
 ft_satang: 0                 # current Ft adjustment, satang/unit (update each quarter)
 vat: 7
 entities:

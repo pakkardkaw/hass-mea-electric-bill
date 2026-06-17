@@ -63,6 +63,28 @@ function getCycleStart(cutoffDay, now) {
   return start;
 }
 
+const PERIODS = {
+  day: { label: "Day" },
+  week: { label: "Week" },
+  month: { label: "Month" },
+  cycle: { label: "Bill cycle" },
+};
+
+function getPeriodStart(period, cutoffDay, now) {
+  if (period === "day") {
+    return new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+  }
+  if (period === "week") {
+    const diffToMonday = (now.getDay() + 6) % 7; // Mon=0 ... Sun=6
+    const start = new Date(now.getFullYear(), now.getMonth(), now.getDate() - diffToMonday, 0, 0, 0, 0);
+    return start;
+  }
+  if (period === "month") {
+    return new Date(now.getFullYear(), now.getMonth(), 1, 0, 0, 0, 0);
+  }
+  return getCycleStart(cutoffDay, now);
+}
+
 // MEA residential TOU schedule: on-peak is Mon-Fri 09:00-22:00; everything else
 // (nights, and all day Sat/Sun) is off-peak. Public holidays are also off-peak
 // under MEA's actual rules, but aren't accounted for here since HA has no
@@ -169,6 +191,7 @@ class MeaElectricBillCard extends HTMLElement {
       cutoff_day: 1,
       ft_satang: 0,
       vat: VAT_DEFAULT,
+      default_period: "cycle",
       entities: {},
     };
   }
@@ -187,6 +210,7 @@ class MeaElectricBillCard extends HTMLElement {
     if (cutoffDay < 1 || cutoffDay > 31) {
       throw new Error("cutoff_day must be between 1 and 31");
     }
+    const defaultPeriod = PERIODS[config.default_period] ? config.default_period : "cycle";
     this._config = {
       name: config.name || "Electric Bill",
       scheme,
@@ -197,6 +221,7 @@ class MeaElectricBillCard extends HTMLElement {
       entities,
       rates: config.rates || {},
     };
+    if (!this._period) this._period = defaultPeriod;
     this._lastFetch = 0;
     this._render();
   }
@@ -217,11 +242,18 @@ class MeaElectricBillCard extends HTMLElement {
     return 4;
   }
 
+  _setPeriod(period) {
+    if (this._period === period) return;
+    this._period = period;
+    this._lastFetch = 0;
+    this._updateUsage();
+  }
+
   async _updateUsage() {
     if (!this._hass || !this._config) return;
     const cfg = this._config;
     const now = new Date();
-    const start = getCycleStart(cfg.cutoff_day, now);
+    const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
 
     const points = await fetchSeries(this._hass, cfg.entities.total, start, now);
     if (cfg.scheme === "normal") {
@@ -317,9 +349,17 @@ class MeaElectricBillCard extends HTMLElement {
     if (!this.shadowRoot) this.attachShadow({ mode: "open" });
 
     const bill = this._calcBill();
+    const period = this._period || "cycle";
     const cycleLabel = this._cycleStart
       ? `Since ${this._cycleStart.toLocaleDateString()}`
       : "Loading usage…";
+
+    const tabs = Object.entries(PERIODS)
+      .map(
+        ([key, def]) =>
+          `<button class="tab${key === period ? " active" : ""}" data-period="${key}">${def.label}</button>`
+      )
+      .join("");
 
     const rows = bill.lines
       .map(
@@ -360,6 +400,21 @@ class MeaElectricBillCard extends HTMLElement {
           font-size: 0.9em;
           color: var(--success-color, #4caf50);
         }
+        .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
+        .tab {
+          flex: 1;
+          padding: 6px 0;
+          border: none;
+          border-radius: 6px;
+          background: var(--secondary-background-color, #eee);
+          color: var(--primary-text-color);
+          font-size: 0.85em;
+          cursor: pointer;
+        }
+        .tab.active {
+          background: var(--primary-color);
+          color: var(--text-primary-color, #fff);
+        }
       </style>
       <ha-card>
         <div class="header">
@@ -369,6 +424,7 @@ class MeaElectricBillCard extends HTMLElement {
           </div>
           <span class="scheme-badge">${this._config.scheme === "tou" ? "TOU" : "Normal"}</span>
         </div>
+        <div class="tabs">${tabs}</div>
         <table>
           ${rows}
           <tr class="total-row"><td>Estimated total</td><td class="num">${bill.total.toFixed(2)} ฿</td></tr>
@@ -376,6 +432,10 @@ class MeaElectricBillCard extends HTMLElement {
         ${savingsBlock}
       </ha-card>
     `;
+
+    this.shadowRoot.querySelectorAll(".tab").forEach((btn) => {
+      btn.addEventListener("click", () => this._setPeriod(btn.dataset.period));
+    });
   }
 }
 
@@ -518,6 +578,17 @@ class MeaElectricBillCardEditor extends HTMLElement {
           <input id="cutoff_day" type="number" min="1" max="31" value="${cfg.cutoff_day}" />
         </div>
       </div>
+      <div class="row">
+        <label>Default view</label>
+        <select id="default_period">
+          ${Object.entries(PERIODS)
+            .map(
+              ([key, def]) =>
+                `<option value="${key}" ${cfg.default_period === key ? "selected" : ""}>${def.label}</option>`
+            )
+            .join("")}
+        </select>
+      </div>
       ${
         !isTou
           ? `<div class="row">
@@ -566,6 +637,9 @@ class MeaElectricBillCardEditor extends HTMLElement {
     $("scheme").addEventListener("change", (e) => this._valueChanged(["scheme"], e.target.value));
     $("cutoff_day").addEventListener("change", (e) =>
       this._valueChanged(["cutoff_day"], Number(e.target.value))
+    );
+    $("default_period").addEventListener("change", (e) =>
+      this._valueChanged(["default_period"], e.target.value)
     );
     $("ft_satang").addEventListener("change", (e) =>
       this._valueChanged(["ft_satang"], Number(e.target.value))
