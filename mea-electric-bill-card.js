@@ -137,20 +137,40 @@ async function fetchStatPoints(hass, entityId, start, end) {
   const series = (result && result[entityId]) || [];
   return series
     .filter((p) => p.sum != null)
-    .map((p) => ({ time: new Date(p.start), value: p.sum }))
+    .map((p) => ({ time: new Date(p.start), end: new Date(p.end), value: p.sum }))
     .sort((a, b) => a.time - b.time);
 }
 
-// Combines long-term statistics (for everything older than the last
-// completed hour, so the cycle/week/month total stays correct even past the
-// recorder's raw-history retention window) with short-term history (for the
-// most recent, not-yet-aggregated minutes) into one continuous series.
-async function fetchCombinedSeries(hass, entityId, start, end) {
+// Long-term statistics' "sum" and raw history's "state" are NOT on the same
+// numeric scale (the recorder tracks "sum" as an independently accumulated
+// growth value, not the raw entity reading), so they must never be spliced
+// into a single delta series - mixing them creates one huge fake delta at
+// the seam. Instead, fetch each source for its own non-overlapping time
+// range and compute usage within each source independently; the two partial
+// totals are summed afterward (see totalUsageMulti / splitUsageByPeakMulti).
+async function fetchUsageSegments(hass, entityId, start, end) {
   if (!entityId) return [];
   const statPoints = await fetchStatPoints(hass, entityId, start, end);
-  const tailStart = statPoints.length ? statPoints[statPoints.length - 1].time : start;
+  const tailStart = statPoints.length ? statPoints[statPoints.length - 1].end : start;
   const tailPoints = await fetchSeries(hass, entityId, tailStart, end);
-  return [...statPoints, ...tailPoints].sort((a, b) => a.time - b.time);
+  const segments = [];
+  if (statPoints.length) segments.push(statPoints);
+  if (tailPoints.length) segments.push(tailPoints);
+  return segments;
+}
+
+function totalUsageMulti(segments) {
+  return segments.reduce((sum, pts) => sum + totalUsage(pts), 0);
+}
+
+function splitUsageByPeakMulti(segments) {
+  return segments.reduce(
+    (acc, pts) => {
+      const split = splitUsageByPeak(pts);
+      return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
+    },
+    { onPeak: 0, offPeak: 0 }
+  );
 }
 
 function totalUsage(points) {
@@ -213,6 +233,16 @@ function splitSelfConsumedByPeak(pvPoints, ratePoints) {
     }
   }
   return { onPeak, offPeak };
+}
+
+function splitSelfConsumedByPeakMulti(pvSegments, ratePoints) {
+  return pvSegments.reduce(
+    (acc, pts) => {
+      const split = splitSelfConsumedByPeak(pts, ratePoints);
+      return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
+    },
+    { onPeak: 0, offPeak: 0 }
+  );
 }
 
 function toArray(v) {
@@ -299,15 +329,17 @@ class MeaElectricBillCard extends HTMLElement {
     const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
 
     const totalEntities = toArray(cfg.entities.total);
-    const pointsPerEntity = await Promise.all(
-      totalEntities.map((id) => fetchCombinedSeries(this._hass, id, start, now))
+    const segmentsPerEntity = await Promise.all(
+      totalEntities.map((id) => fetchUsageSegments(this._hass, id, start, now))
     );
     if (cfg.scheme === "normal") {
-      this._usage = { units: pointsPerEntity.reduce((sum, pts) => sum + totalUsage(pts), 0) };
+      this._usage = {
+        units: segmentsPerEntity.reduce((sum, segs) => sum + totalUsageMulti(segs), 0),
+      };
     } else {
-      this._usage = pointsPerEntity.reduce(
-        (acc, pts) => {
-          const split = splitUsageByPeak(pts);
+      this._usage = segmentsPerEntity.reduce(
+        (acc, segs) => {
+          const split = splitUsageByPeakMulti(segs);
           return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
         },
         { onPeak: 0, offPeak: 0 }
@@ -315,11 +347,11 @@ class MeaElectricBillCard extends HTMLElement {
     }
 
     if (cfg.entities.pv_total) {
-      const [pvPoints, ratePoints] = await Promise.all([
-        fetchCombinedSeries(this._hass, cfg.entities.pv_total, start, now),
+      const [pvSegments, ratePoints] = await Promise.all([
+        fetchUsageSegments(this._hass, cfg.entities.pv_total, start, now),
         fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now),
       ]);
-      this._selfConsumed = splitSelfConsumedByPeak(pvPoints, ratePoints);
+      this._selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, ratePoints);
     } else {
       this._selfConsumed = null;
     }
