@@ -105,9 +105,14 @@ rates:
 ## Notes
 
 - Selected entities must be **cumulative/total_increasing** energy sensors
-  (kWh), not instantaneous power. Usage for the current cycle is computed as
-  the difference between the sensor's value at the most recent cutoff day and
-  now, via Home Assistant's history API.
+  (kWh), not instantaneous power. Usage is computed from Home Assistant's
+  recorder **long-term statistics** (retained indefinitely, hourly
+  resolution, and already compensated for meter resets) combined with raw
+  **history** for the most recent minutes that haven't been aggregated into
+  statistics yet. This means accurate totals even for billing cycles/months
+  that extend past your recorder's history retention window (commonly ~10
+  days) — as long as long-term statistics are enabled for the entity (the
+  default for energy sensors with a `total`/`total_increasing` state class).
 - The default rates and Ft value are illustrative; always confirm current
   rates against your actual MEA bill, since Ft is revised quarterly.
 - This card is presentation/estimation only — it does not modify your actual

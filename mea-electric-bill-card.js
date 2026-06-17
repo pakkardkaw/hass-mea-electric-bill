@@ -115,6 +115,44 @@ async function fetchSeries(hass, entityId, start, end) {
     .sort((a, b) => a.time - b.time);
 }
 
+// Long-term statistics (recorder/statistics_during_period) are retained
+// indefinitely at hourly resolution, unlike raw history which is typically
+// purged after ~10 days. The "sum" stat already compensates for meter
+// resets, so it's the more robust source whenever it's available.
+async function fetchStatPoints(hass, entityId, start, end) {
+  if (!entityId) return [];
+  let result;
+  try {
+    result = await hass.callWS({
+      type: "recorder/statistics_during_period",
+      start_time: start.toISOString(),
+      end_time: end.toISOString(),
+      statistic_ids: [entityId],
+      period: "hour",
+      types: ["sum"],
+    });
+  } catch (err) {
+    return [];
+  }
+  const series = (result && result[entityId]) || [];
+  return series
+    .filter((p) => p.sum != null)
+    .map((p) => ({ time: new Date(p.start), value: p.sum }))
+    .sort((a, b) => a.time - b.time);
+}
+
+// Combines long-term statistics (for everything older than the last
+// completed hour, so the cycle/week/month total stays correct even past the
+// recorder's raw-history retention window) with short-term history (for the
+// most recent, not-yet-aggregated minutes) into one continuous series.
+async function fetchCombinedSeries(hass, entityId, start, end) {
+  if (!entityId) return [];
+  const statPoints = await fetchStatPoints(hass, entityId, start, end);
+  const tailStart = statPoints.length ? statPoints[statPoints.length - 1].time : start;
+  const tailPoints = await fetchSeries(hass, entityId, tailStart, end);
+  return [...statPoints, ...tailPoints].sort((a, b) => a.time - b.time);
+}
+
 function totalUsage(points) {
   if (!points.length) return 0;
   const first = points[0].value;
@@ -262,7 +300,7 @@ class MeaElectricBillCard extends HTMLElement {
 
     const totalEntities = toArray(cfg.entities.total);
     const pointsPerEntity = await Promise.all(
-      totalEntities.map((id) => fetchSeries(this._hass, id, start, now))
+      totalEntities.map((id) => fetchCombinedSeries(this._hass, id, start, now))
     );
     if (cfg.scheme === "normal") {
       this._usage = { units: pointsPerEntity.reduce((sum, pts) => sum + totalUsage(pts), 0) };
@@ -278,7 +316,7 @@ class MeaElectricBillCard extends HTMLElement {
 
     if (cfg.entities.pv_total) {
       const [pvPoints, ratePoints] = await Promise.all([
-        fetchSeries(this._hass, cfg.entities.pv_total, start, now),
+        fetchCombinedSeries(this._hass, cfg.entities.pv_total, start, now),
         fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now),
       ]);
       this._selfConsumed = splitSelfConsumedByPeak(pvPoints, ratePoints);
