@@ -19,6 +19,10 @@ MEA residential rate schemes and a per-user billing cutoff day.
   resets (1–31); usage is calculated from the most recent cutoff to now.
 - Includes the Ft (fuel adjustment) charge and VAT in the estimate.
 - Visual editor in the Lovelace UI — no YAML required.
+- Optional solar savings — set a PV Energy Total sensor and a PV Self
+  Consumption Rate sensor and the card shows how much the self-consumed solar
+  energy (PV total × self-consumption rate) saved you, valued at the
+  on/off-peak or tiered rate in effect when it was generated.
 
 ## Installation (HACS)
 
@@ -42,6 +46,8 @@ ft_satang: 0                 # current Ft adjustment, satang/unit (update each q
 vat: 7
 entities:
   total: sensor.atmoce_grid_energy_total   # cumulative kWh sensor
+  pv_total: sensor.atmoce_pv_energy_total                    # optional
+  pv_self_consumption_rate: sensor.atmoce_pv_self_consumption_rate  # optional, %
 ```
 
 ### TOU scheme

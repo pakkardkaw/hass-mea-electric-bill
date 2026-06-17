@@ -122,6 +122,39 @@ function splitUsageByPeak(points) {
   return { onPeak, offPeak };
 }
 
+// Finds the most recent value in `points` at or before `time` (used to look
+// up a self-consumption-rate % sensor at the timestamp of a PV energy delta).
+function valueAt(points, time) {
+  if (!points.length) return null;
+  let result = points[0].value;
+  for (const p of points) {
+    if (p.time > time) break;
+    result = p.value;
+  }
+  return result;
+}
+
+// Computes self-consumed PV energy (PV production that directly offset grid
+// import, as opposed to being exported) split by on-peak/off-peak, using
+// PV Energy Total deltas weighted by the self-consumption rate (%) sensor
+// sampled at the start of each interval.
+function splitSelfConsumedByPeak(pvPoints, ratePoints) {
+  let onPeak = 0;
+  let offPeak = 0;
+  for (let i = 1; i < pvPoints.length; i++) {
+    let delta = pvPoints[i].value - pvPoints[i - 1].value;
+    if (delta < 0) delta = pvPoints[i].value; // meter reset mid-cycle
+    const rate = valueAt(ratePoints, pvPoints[i - 1].time);
+    const selfConsumed = delta * ((rate == null ? 100 : rate) / 100);
+    if (isOnPeak(pvPoints[i - 1].time)) {
+      onPeak += selfConsumed;
+    } else {
+      offPeak += selfConsumed;
+    }
+  }
+  return { onPeak, offPeak };
+}
+
 class MeaElectricBillCard extends HTMLElement {
   static getConfigElement() {
     return document.createElement("mea-electric-bill-card-editor");
@@ -196,6 +229,17 @@ class MeaElectricBillCard extends HTMLElement {
     } else {
       this._usage = splitUsageByPeak(points);
     }
+
+    if (cfg.entities.pv_total) {
+      const [pvPoints, ratePoints] = await Promise.all([
+        fetchSeries(this._hass, cfg.entities.pv_total, start, now),
+        fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now),
+      ]);
+      this._selfConsumed = splitSelfConsumedByPeak(pvPoints, ratePoints);
+    } else {
+      this._selfConsumed = null;
+    }
+
     this._cycleStart = start;
     this._render();
   }
@@ -207,6 +251,8 @@ class MeaElectricBillCard extends HTMLElement {
     let units;
     let energyCharge;
     let serviceCharge;
+    let savingsEnergy = 0; // baht of energy charge avoided by self-consumed PV
+    let selfConsumedUnits = 0;
     const lines = [];
 
     if (cfg.scheme === "normal") {
@@ -217,6 +263,14 @@ class MeaElectricBillCard extends HTMLElement {
       energyCharge = tieredEnergyCharge(units, rateSet.tiers);
       serviceCharge = rateSet.serviceCharge;
       lines.push([`Energy (${units.toFixed(2)} units, tiered)`, energyCharge]);
+
+      if (this._selfConsumed) {
+        selfConsumedUnits = this._selfConsumed.onPeak + this._selfConsumed.offPeak;
+        // Value the avoided units at their marginal (top-of-stack) rate: the
+        // extra cost it would have taken to buy them from the grid on top of
+        // what was actually billed.
+        savingsEnergy = tieredEnergyCharge(units + selfConsumedUnits, rateSet.tiers) - energyCharge;
+      }
     } else {
       const rateSet = cfg.rates.tou || DEFAULT_RATES.tou;
       const onPeak = (this._usage && this._usage.onPeak) || 0;
@@ -228,6 +282,12 @@ class MeaElectricBillCard extends HTMLElement {
       serviceCharge = rateSet.serviceCharge;
       lines.push([`On-peak (${onPeak.toFixed(2)} units)`, onPeakCharge]);
       lines.push([`Off-peak (${offPeak.toFixed(2)} units)`, offPeakCharge]);
+
+      if (this._selfConsumed) {
+        selfConsumedUnits = this._selfConsumed.onPeak + this._selfConsumed.offPeak;
+        savingsEnergy =
+          this._selfConsumed.onPeak * rateSet.onPeakRate + this._selfConsumed.offPeak * rateSet.offPeakRate;
+      }
     }
 
     const ftCharge = units * ft;
@@ -238,7 +298,18 @@ class MeaElectricBillCard extends HTMLElement {
     lines.push([`VAT (${vat}%)`, vatAmount]);
     const total = subtotal + vatAmount;
 
-    return { units, lines, total };
+    let savings = null;
+    if (this._selfConsumed) {
+      const savingsFt = selfConsumedUnits * ft;
+      const savingsSubtotal = savingsEnergy + savingsFt;
+      const savingsVat = savingsSubtotal * (vat / 100);
+      savings = {
+        units: selfConsumedUnits,
+        total: savingsSubtotal + savingsVat,
+      };
+    }
+
+    return { units, lines, total, savings };
   }
 
   _render() {
@@ -257,6 +328,13 @@ class MeaElectricBillCard extends HTMLElement {
       )
       .join("");
 
+    const savingsBlock = bill.savings
+      ? `<div class="savings">
+          <span>☀ Solar self-consumption (${bill.savings.units.toFixed(2)} units)</span>
+          <span class="num">-${bill.savings.total.toFixed(2)} ฿</span>
+        </div>`
+      : "";
+
     this.shadowRoot.innerHTML = `
       <style>
         ha-card { padding: 16px; }
@@ -273,6 +351,15 @@ class MeaElectricBillCard extends HTMLElement {
           border-radius: 8px;
           padding: 2px 8px;
         }
+        .savings {
+          display: flex;
+          justify-content: space-between;
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed var(--divider-color);
+          font-size: 0.9em;
+          color: var(--success-color, #4caf50);
+        }
       </style>
       <ha-card>
         <div class="header">
@@ -286,6 +373,7 @@ class MeaElectricBillCard extends HTMLElement {
           ${rows}
           <tr class="total-row"><td>Estimated total</td><td class="num">${bill.total.toFixed(2)} ฿</td></tr>
         </table>
+        ${savingsBlock}
       </ha-card>
     `;
   }
@@ -450,6 +538,15 @@ class MeaElectricBillCardEditor extends HTMLElement {
           ? `<div class="row hint">On-peak/off-peak usage is split automatically from this single sensor based on time of day and day of week (Mon-Fri 09:00-22:00 = on-peak).</div>`
           : ""
       }
+      <div class="row">
+        <label>PV energy total sensor (optional, cumulative kWh)</label>
+        <ha-entity-picker id="entity_pv_total"></ha-entity-picker>
+      </div>
+      <div class="row">
+        <label>PV self consumption rate sensor (optional, %)</label>
+        <ha-entity-picker id="entity_pv_self_consumption_rate"></ha-entity-picker>
+      </div>
+      <div class="row hint">If set, the card shows how much these saved you (PV Energy Total × Self Consumption Rate, valued at the on/off-peak time it was generated).</div>
       <div class="two-col">
         <div class="row">
           <label>Ft adjustment (satang/unit)</label>
@@ -501,12 +598,18 @@ class MeaElectricBillCardEditor extends HTMLElement {
         this._rateChanged(["tou", "offPeakRate"], Number(e.target.value))
       );
     }
-    const totalPicker = $("entity_total");
-    if (totalPicker) {
-      totalPicker.hass = this._hass;
-      totalPicker.value = cfg.entities.total || "";
-      totalPicker.addEventListener("value-changed", (e) =>
-        this._valueChanged(["entities", "total"], e.detail.value)
+    const pickerSpecs = [
+      ["entity_total", "total"],
+      ["entity_pv_total", "pv_total"],
+      ["entity_pv_self_consumption_rate", "pv_self_consumption_rate"],
+    ];
+    for (const [elemId, key] of pickerSpecs) {
+      const picker = $(elemId);
+      if (!picker) continue;
+      picker.hass = this._hass;
+      picker.value = cfg.entities[key] || "";
+      picker.addEventListener("value-changed", (e) =>
+        this._valueChanged(["entities", key], e.detail.value)
       );
     }
   }
