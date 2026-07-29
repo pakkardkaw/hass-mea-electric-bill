@@ -111,10 +111,12 @@ default_period: cycle        # day | week | month | cycle (default tab shown)
 ft_baht: 0.1623               # current Ft adjustment, baht/unit (update each quarter, or use ft_entity below)
 vat: 7
 entities:
-  total: sensor.atmoce_grid_energy_total   # cumulative kWh sensor
-  pv_total: sensor.atmoce_pv_energy_total                        # optional
-  pv_export_total: sensor.atmoce_electricity_sold_total          # optional, preferred over the rate below
+  total: sensor.atmoce_grid_energy_total                            # cumulative kWh sensor
+  pv_total: sensor.atmoce_pv_energy_total                           # optional
+  pv_export_total: sensor.atmoce_electricity_sold_total             # optional, preferred over the rate below
   pv_self_consumption_rate: sensor.atmoce_pv_self_consumption_rate  # optional, %, fallback
+export_rate: 2.20    # optional, ฿/unit buy-back rate - only relevant if show_export is true
+show_export: false   # optional, only enable if you're registered in PEA's solar buy-back programme
 ```
 
 If you have more than one grid meter, `entities.total` also accepts a list and
@@ -138,10 +140,20 @@ cutoff_day: 5
 ft_baht: 0.1623
 vat: 7
 entities:
-  total: sensor.atmoce_grid_energy_total   # same single cumulative kWh sensor
+  total: sensor.atmoce_grid_energy_total                            # same single cumulative kWh sensor
+  pv_total: sensor.atmoce_pv_energy_total                           # optional
+  pv_export_total: sensor.atmoce_electricity_sold_total             # optional, preferred over the rate below
+  pv_self_consumption_rate: sensor.atmoce_pv_self_consumption_rate  # optional, %, fallback
+export_rate: 2.20    # optional, ฿/unit buy-back rate - only relevant if show_export is true
+show_export: false   # optional, only enable if you're registered in PEA's solar buy-back programme
 holiday_calendar: calendar.thailand_holidays   # optional, see "Holiday-aware TOU billing" below
 holiday_dates: []                              # optional, extra static YYYY-MM-DD off-peak dates
 ```
+
+Solar self-consumption, export revenue, and holiday-aware billing work the
+same way under TOU as under Normal — they're independent of `scheme`. The
+Normal example above and this one both show the same `entities` block for
+that reason; use whichever fields are relevant to your setup.
 
 On-peak/off-peak split is derived automatically from the timestamps of the
 sensor's history (Mon-Fri 09:00-22:00 = on-peak; nights and all day Sat/Sun =
