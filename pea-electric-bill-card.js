@@ -1,14 +1,16 @@
-/* MEA Electric Bill Card
- * A Lovelace card that estimates a Metropolitan Electricity Authority (MEA, Thailand)
+/* PEA Electric Bill Card
+ * A Lovelace card that estimates a Provincial Electricity Authority (PEA, Thailand)
  * residential electric bill from cumulative energy sensors (e.g. exposed by a battery /
  * energy-monitoring integration), supporting both the "Normal" (tiered/bucket) tariff
- * and the "TOU" (Time of Use) tariff, with a user-configurable billing cycle cutoff day.
+ * and the "TOU" (Time of Use) tariff split by voltage level, with a user-configurable
+ * billing cycle cutoff day, an optional Ft sensor for auto-updating fuel adjustment,
+ * Thai holiday-aware TOU billing, and PEA solar buy-back (export) revenue.
  */
 
 const DEFAULT_RATES = {
   normal: {
-    "1.1": {
-      label: "Type 1.1 (≤150 units/month)",
+    "1.1.1": {
+      label: "Type 1.1.1 (≤150 units/month)",
       serviceCharge: 8.19,
       tiers: [
         { upTo: 15, rate: 2.3488 },
@@ -20,8 +22,8 @@ const DEFAULT_RATES = {
         { upTo: Infinity, rate: 4.4217 },
       ],
     },
-    "1.2": {
-      label: "Type 1.2 (>150 units/month)",
+    "1.1.2": {
+      label: "Type 1.1.2 (>150 units/month)",
       serviceCharge: 24.62,
       tiers: [
         { upTo: 150, rate: 3.2484 },
@@ -30,14 +32,37 @@ const DEFAULT_RATES = {
       ],
     },
   },
+  // PEA's TOU tariff (No. 1.2) is split by voltage level, unlike MEA's flat TOU rate.
+  // Virtually every residential customer is on 1.2.2 (below 22 kV).
   tou: {
-    serviceCharge: 38.22,
-    onPeakRate: 5.7982,
-    offPeakRate: 2.6369,
+    "1.2.1": {
+      label: "1.2.1 - 22-33 kV",
+      serviceCharge: 312.24,
+      onPeakRate: 5.1135,
+      offPeakRate: 2.6037,
+    },
+    "1.2.2": {
+      label: "1.2.2 - below 22 kV",
+      serviceCharge: 24.62,
+      onPeakRate: 5.7982,
+      offPeakRate: 2.6369,
+    },
   },
 };
 
 const VAT_DEFAULT = 7;
+// Current Ft (May-Aug 2569) published at https://www.pea.co.th/our-services/tariff/ft
+const FT_DEFAULT = 0.1623;
+// PEA "Solar Phak Prachachon" residential rooftop buy-back rate, 2569 round.
+const EXPORT_RATE_DEFAULT = 2.2;
+
+// Keyword sets used to classify calendar-sourced holiday events for TOU billing.
+// PEA bills two categories of "holiday" as on-peak rather than off-peak (see
+// isOnPeak below): the Royal Ploughing Ceremony Day, and compensatory holidays.
+const DEFAULT_HOLIDAY_KEYWORDS = {
+  ploughing: ["พืชมงคล", "Ploughing"],
+  compensatory: ["ชดเชย", "Compensatory"],
+};
 
 function tieredEnergyCharge(units, tiers) {
   let remaining = Math.max(0, units);
@@ -85,15 +110,40 @@ function getPeriodStart(period, cutoffDay, now) {
   return getCycleStart(cutoffDay, now);
 }
 
-// MEA residential TOU schedule: on-peak is Mon-Fri 09:00-22:00; everything else
-// (nights, and all day Sat/Sun) is off-peak. Public holidays are also off-peak
-// under MEA's actual rules, but aren't accounted for here since HA has no
-// built-in Thai holiday calendar - see README for the limitation.
-function isOnPeak(date) {
+function dateKeyOf(date) {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, "0");
+  const d = String(date.getDate()).padStart(2, "0");
+  return `${y}-${m}-${d}`;
+}
+
+// PEA residential TOU schedule (Mon-Fri 09:00-22:00 = on-peak) plus PEA's actual
+// holiday rules, which are easy to get wrong: most public holidays ARE off-peak,
+// but the Royal Ploughing Ceremony Day and compensatory holidays (วันหยุดชดเชย)
+// are billed as ordinary on-peak weekdays. `holidays` is a Map of "YYYY-MM-DD" ->
+// "ploughing" | "compensatory" | "other", built by fetchHolidays(); pass null/undefined
+// to fall back to plain weekday/weekend classification (used when scheme is Normal,
+// where the peak split is computed but never billed).
+function isOnPeak(date, holidays) {
   const day = date.getDay(); // 0 = Sunday, 6 = Saturday
-  if (day === 0 || day === 6) return false;
+  const holidayType = holidays ? holidays.get(dateKeyOf(date)) : null;
   const hour = date.getHours();
-  return hour >= 9 && hour < 22;
+  const isWeekdayHours = hour >= 9 && hour < 22;
+
+  if (holidayType === "ploughing") {
+    // Still a holiday: off-peak if it happens to fall on a weekend, otherwise
+    // billed like a normal weekday.
+    if (day === 0 || day === 6) return false;
+    return isWeekdayHours;
+  }
+  if (holidayType === "compensatory") {
+    // Treated as an ordinary working day regardless of the underlying weekday.
+    return isWeekdayHours;
+  }
+  if (holidayType === "other") return false; // any other public holiday -> off-peak all day
+
+  if (day === 0 || day === 6) return false;
+  return isWeekdayHours;
 }
 
 async function fetchSeries(hass, entityId, start, end) {
@@ -148,25 +198,29 @@ async function fetchStatPoints(hass, entityId, start, end) {
 // the seam. Instead, fetch each source for its own non-overlapping time
 // range and compute usage within each source independently; the two partial
 // totals are summed afterward (see totalUsageMulti / splitUsageByPeakMulti).
+// Each returned segment is labelled with its source so that two different
+// sensors (e.g. PV total and export total, see splitSelfConsumedByExport)
+// can be paired stats-with-stats and history-with-history rather than ever
+// being compared across the scale boundary.
 async function fetchUsageSegments(hass, entityId, start, end) {
   if (!entityId) return [];
   const statPoints = await fetchStatPoints(hass, entityId, start, end);
   const tailStart = statPoints.length ? statPoints[statPoints.length - 1].end : start;
   const tailPoints = await fetchSeries(hass, entityId, tailStart, end);
   const segments = [];
-  if (statPoints.length) segments.push(statPoints);
-  if (tailPoints.length) segments.push(tailPoints);
+  if (statPoints.length) segments.push({ source: "stats", points: statPoints });
+  if (tailPoints.length) segments.push({ source: "history", points: tailPoints });
   return segments;
 }
 
 function totalUsageMulti(segments) {
-  return segments.reduce((sum, pts) => sum + totalUsage(pts), 0);
+  return segments.reduce((sum, seg) => sum + totalUsage(seg.points), 0);
 }
 
-function splitUsageByPeakMulti(segments) {
+function splitUsageByPeakMulti(segments, holidays) {
   return segments.reduce(
-    (acc, pts) => {
-      const split = splitUsageByPeak(pts);
+    (acc, seg) => {
+      const split = splitUsageByPeak(seg.points, holidays);
       return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
     },
     { onPeak: 0, offPeak: 0 }
@@ -187,13 +241,13 @@ function totalUsage(points) {
 // Splits a single cumulative-energy series into on-peak / off-peak totals by
 // classifying each delta between consecutive readings using the timestamp of
 // the start of that interval.
-function splitUsageByPeak(points) {
+function splitUsageByPeak(points, holidays) {
   let onPeak = 0;
   let offPeak = 0;
   for (let i = 1; i < points.length; i++) {
     let delta = points[i].value - points[i - 1].value;
     if (delta < 0) delta = points[i].value; // meter reset mid-cycle
-    if (isOnPeak(points[i - 1].time)) {
+    if (isOnPeak(points[i - 1].time, holidays)) {
       onPeak += delta;
     } else {
       offPeak += delta;
@@ -203,7 +257,8 @@ function splitUsageByPeak(points) {
 }
 
 // Finds the most recent value in `points` at or before `time` (used to look
-// up a self-consumption-rate % sensor at the timestamp of a PV energy delta).
+// up a self-consumption-rate % sensor, or an export-total sensor, at the
+// timestamp of a PV energy delta).
 function valueAt(points, time) {
   if (!points.length) return null;
   let result = points[0].value;
@@ -217,8 +272,10 @@ function valueAt(points, time) {
 // Computes self-consumed PV energy (PV production that directly offset grid
 // import, as opposed to being exported) split by on-peak/off-peak, using
 // PV Energy Total deltas weighted by the self-consumption rate (%) sensor
-// sampled at the start of each interval.
-function splitSelfConsumedByPeak(pvPoints, ratePoints) {
+// sampled at the start of each interval. This is the fallback method for
+// inverters that only expose a percentage rather than a cumulative export
+// total - see splitSelfConsumedByExport for the preferred method.
+function splitSelfConsumedByPeak(pvPoints, ratePoints, holidays) {
   let onPeak = 0;
   let offPeak = 0;
   for (let i = 1; i < pvPoints.length; i++) {
@@ -226,7 +283,7 @@ function splitSelfConsumedByPeak(pvPoints, ratePoints) {
     if (delta < 0) delta = pvPoints[i].value; // meter reset mid-cycle
     const rate = valueAt(ratePoints, pvPoints[i - 1].time);
     const selfConsumed = delta * ((rate == null ? 100 : rate) / 100);
-    if (isOnPeak(pvPoints[i - 1].time)) {
+    if (isOnPeak(pvPoints[i - 1].time, holidays)) {
       onPeak += selfConsumed;
     } else {
       offPeak += selfConsumed;
@@ -235,10 +292,69 @@ function splitSelfConsumedByPeak(pvPoints, ratePoints) {
   return { onPeak, offPeak };
 }
 
-function splitSelfConsumedByPeakMulti(pvSegments, ratePoints) {
+function splitSelfConsumedByPeakMulti(pvSegments, ratePoints, holidays) {
   return pvSegments.reduce(
-    (acc, pts) => {
-      const split = splitSelfConsumedByPeak(pts, ratePoints);
+    (acc, seg) => {
+      const split = splitSelfConsumedByPeak(seg.points, ratePoints, holidays);
+      return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
+    },
+    { onPeak: 0, offPeak: 0 }
+  );
+}
+
+// Computes self-consumed PV energy directly: PV Energy Total delta minus the
+// matching Electricity Sold (export) delta for the same interval, clamped at
+// >= 0. This is the preferred method whenever a cumulative export sensor is
+// available (e.g. Atmoce's "Electricity Sold Total") - it is a direct
+// measurement rather than an interpolated percentage, and (being
+// TOTAL_INCREASING/ENERGY) it survives in long-term statistics the way the
+// self-consumption-rate % sensor typically does not.
+//
+// Note: with a battery in the system, PV - export also counts energy that
+// went into charging the battery as "self-consumed" at that moment's TOU
+// rate, even though it may actually displace grid import later (often at a
+// different peak/off-peak rate). The result is therefore an approximation
+// for battery systems, not an exact figure.
+function splitSelfConsumedByExport(pvPoints, exportPoints, holidays) {
+  let onPeak = 0;
+  let offPeak = 0;
+  for (let i = 1; i < pvPoints.length; i++) {
+    let pvDelta = pvPoints[i].value - pvPoints[i - 1].value;
+    if (pvDelta < 0) pvDelta = pvPoints[i].value; // meter reset mid-cycle
+
+    const exportStart = valueAt(exportPoints, pvPoints[i - 1].time);
+    const exportEnd = valueAt(exportPoints, pvPoints[i].time);
+    let exportDelta = exportStart == null || exportEnd == null ? 0 : exportEnd - exportStart;
+    if (exportDelta < 0) exportDelta = 0; // meter reset mid-cycle
+
+    // A discharging battery can push export above PV production within a
+    // single interval; self-consumed can never be negative.
+    const selfConsumed = Math.max(0, pvDelta - exportDelta);
+    if (isOnPeak(pvPoints[i - 1].time, holidays)) {
+      onPeak += selfConsumed;
+    } else {
+      offPeak += selfConsumed;
+    }
+  }
+  return { onPeak, offPeak };
+}
+
+// Pairs two labelled segment lists (see fetchUsageSegments) by source, so
+// that deltas are only ever compared within the same numeric scale (stats
+// with stats, history with history). Segments whose source has no match on
+// the other side are dropped rather than guessed at.
+function pairSegmentsBySource(aSegments, bSegments) {
+  const bBySource = new Map(bSegments.map((s) => [s.source, s.points]));
+  return aSegments
+    .filter((s) => bBySource.has(s.source))
+    .map((s) => ({ source: s.source, aPoints: s.points, bPoints: bBySource.get(s.source) }));
+}
+
+function splitSelfConsumedByExportMulti(pvSegments, exportSegments, holidays) {
+  const paired = pairSegmentsBySource(pvSegments, exportSegments);
+  return paired.reduce(
+    (acc, { aPoints, bPoints }) => {
+      const split = splitSelfConsumedByExport(aPoints, bPoints, holidays);
       return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
     },
     { onPeak: 0, offPeak: 0 }
@@ -250,22 +366,105 @@ function toArray(v) {
   return Array.isArray(v) ? v.filter(Boolean) : [v];
 }
 
-class MeaElectricBillCard extends HTMLElement {
+// Classifies a holiday calendar event's summary text against configurable
+// keyword lists (see DEFAULT_HOLIDAY_KEYWORDS) so isOnPeak() can apply PEA's
+// on-peak exceptions for the Royal Ploughing Ceremony and compensatory days.
+function classifyHolidayEvent(summary, keywords) {
+  const text = summary || "";
+  const kw = keywords || DEFAULT_HOLIDAY_KEYWORDS;
+  if ((kw.ploughing || []).some((k) => text.includes(k))) return "ploughing";
+  if ((kw.compensatory || []).some((k) => text.includes(k))) return "compensatory";
+  return "other";
+}
+
+// Parses a "YYYY-MM-DD" all-day date string as a LOCAL date. new Date("YYYY-MM-DD")
+// parses as UTC midnight, which for Thailand (UTC+7) usually lands on the same
+// local day but for locations west of UTC can land a day early - splitting and
+// constructing with the (y, m, d) constructor always uses local time and avoids
+// that trap entirely.
+function parseLocalDateOnly(dateStr) {
+  const [y, m, d] = dateStr.split("-").map(Number);
+  return new Date(y, m - 1, d);
+}
+
+// Expands a calendar event's start/end into a list of "YYYY-MM-DD" date keys.
+// All-day calendar events conventionally use an exclusive end date; guard the
+// case where a feed sends an inclusive/same-day end instead.
+function expandAllDayRange(startObj, endObj) {
+  const dates = [];
+  if (!startObj) return dates;
+  const startStr = startObj.date || (startObj.dateTime ? startObj.dateTime.slice(0, 10) : null);
+  if (!startStr) return dates;
+  const endStr = (endObj && (endObj.date || (endObj.dateTime ? endObj.dateTime.slice(0, 10) : null))) || startStr;
+
+  let cur = parseLocalDateOnly(startStr);
+  const end = parseLocalDateOnly(endStr);
+  if (end <= cur) {
+    dates.push(dateKeyOf(cur));
+    return dates;
+  }
+  while (cur < end) {
+    dates.push(dateKeyOf(cur));
+    cur = new Date(cur.getFullYear(), cur.getMonth(), cur.getDate() + 1);
+  }
+  return dates;
+}
+
+async function fetchCalendarEvents(hass, entityId, start, end) {
+  if (!entityId) return [];
+  const path = `calendars/${entityId}?start=${encodeURIComponent(start.toISOString())}&end=${encodeURIComponent(
+    end.toISOString()
+  )}`;
+  let events;
+  try {
+    events = await hass.callApi("GET", path);
+  } catch (err) {
+    return [];
+  }
+  return Array.isArray(events) ? events : [];
+}
+
+// Builds the holiday Map consumed by isOnPeak(): static holiday_dates are
+// classified as "other" (plain off-peak); calendar events are classified via
+// classifyHolidayEvent so the Royal Ploughing Ceremony / compensatory-holiday
+// on-peak exceptions apply. Errors degrade to an empty map (today's plain
+// weekday/weekend behaviour) rather than breaking the card.
+async function fetchHolidays(hass, cfg, start, end) {
+  const holidays = new Map();
+  for (const d of cfg.holiday_dates || []) {
+    if (d) holidays.set(d, "other");
+  }
+  if (cfg.holiday_calendar) {
+    const events = await fetchCalendarEvents(hass, cfg.holiday_calendar, start, end);
+    for (const ev of events) {
+      const type = classifyHolidayEvent(ev.summary, cfg.holiday_onpeak_keywords);
+      for (const d of expandAllDayRange(ev.start, ev.end)) {
+        holidays.set(d, type);
+      }
+    }
+  }
+  return holidays;
+}
+
+class PeaElectricBillCard extends HTMLElement {
   static getConfigElement() {
-    return document.createElement("mea-electric-bill-card-editor");
+    return document.createElement("pea-electric-bill-card-editor");
   }
 
   static getStubConfig() {
     return {
-      type: "custom:mea-electric-bill-card",
+      type: "custom:pea-electric-bill-card",
       name: "Electric Bill",
       scheme: "normal",
-      tariff_class: "1.2",
+      tariff_class: "1.1.2",
+      tou_voltage_level: "1.2.2",
       cutoff_day: 1,
-      ft_satang: 0,
+      ft_baht: FT_DEFAULT,
       vat: VAT_DEFAULT,
       default_period: "cycle",
       entities: {},
+      export_rate: EXPORT_RATE_DEFAULT,
+      show_export: false,
     };
   }
 
@@ -284,15 +483,44 @@ class MeaElectricBillCard extends HTMLElement {
       throw new Error("cutoff_day must be between 1 and 31");
     }
     const defaultPeriod = PERIODS[config.default_period] ? config.default_period : "cycle";
+
+    // Legacy MEA-fork tariff_class values ("1.1"/"1.2") map onto PEA's naming
+    // so an existing dashboard config doesn't break on upgrade.
+    let tariffClass = config.tariff_class;
+    if (tariffClass === "1.1") tariffClass = "1.1.1";
+    if (tariffClass === "1.2") tariffClass = "1.1.2";
+    tariffClass = tariffClass === "1.1.1" ? "1.1.1" : "1.1.2";
+
+    const touVoltageLevel = config.tou_voltage_level === "1.2.1" ? "1.2.1" : "1.2.2";
+
+    // ft_baht (baht/unit) is the only supported unit going forward, matching
+    // what PEA publishes and what the scrape sensor in the README produces.
+    // A config still carrying the old MEA-fork ft_satang key (satang/unit) is
+    // converted once here so an old dashboard doesn't silently produce a
+    // 100x-wrong Ft charge; nothing writes satang back out.
+    const ftBaht =
+      config.ft_baht != null
+        ? Number(config.ft_baht)
+        : config.ft_satang != null
+        ? Number(config.ft_satang) / 100
+        : FT_DEFAULT;
+
     this._config = {
       name: config.name || "Electric Bill",
       scheme,
-      tariff_class: config.tariff_class === "1.1" ? "1.1" : "1.2",
+      tariff_class: tariffClass,
+      tou_voltage_level: touVoltageLevel,
       cutoff_day: cutoffDay,
-      ft_satang: Number(config.ft_satang ?? 0),
+      ft_baht: ftBaht,
+      ft_entity: config.ft_entity || "",
       vat: Number(config.vat ?? VAT_DEFAULT),
       entities,
       rates: config.rates || {},
+      holiday_calendar: config.holiday_calendar || "",
+      holiday_dates: Array.isArray(config.holiday_dates) ? config.holiday_dates.filter(Boolean) : [],
+      holiday_onpeak_keywords: config.holiday_onpeak_keywords || DEFAULT_HOLIDAY_KEYWORDS,
+      export_rate: Number(config.export_rate ?? EXPORT_RATE_DEFAULT),
+      show_export: Boolean(config.show_export),
     };
     if (!this._period) this._period = defaultPeriod;
     this._lastFetch = 0;
@@ -328,6 +556,10 @@ class MeaElectricBillCard extends HTMLElement {
     const now = new Date();
     const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
 
+    // Holidays only affect TOU billing; skip the calendar/dates fetch entirely
+    // for Normal-scheme users.
+    const holidays = cfg.scheme === "tou" ? await fetchHolidays(this._hass, cfg, start, now) : null;
+
     const totalEntities = toArray(cfg.entities.total);
     const segmentsPerEntity = await Promise.all(
       totalEntities.map((id) => fetchUsageSegments(this._hass, id, start, now))
@@ -339,19 +571,29 @@ class MeaElectricBillCard extends HTMLElement {
     } else {
       this._usage = segmentsPerEntity.reduce(
         (acc, segs) => {
-          const split = splitUsageByPeakMulti(segs);
+          const split = splitUsageByPeakMulti(segs, holidays);
           return { onPeak: acc.onPeak + split.onPeak, offPeak: acc.offPeak + split.offPeak };
         },
         { onPeak: 0, offPeak: 0 }
       );
     }
 
+    // Export total is fetched once and used for both the self-consumption
+    // calc (preferred method, see splitSelfConsumedByExport) and the export
+    // revenue line (Phase 6) - it's needed independently of pv_total.
+    const exportSegments = cfg.entities.pv_export_total
+      ? await fetchUsageSegments(this._hass, cfg.entities.pv_export_total, start, now)
+      : null;
+    this._exportUnits = exportSegments ? totalUsageMulti(exportSegments) : null;
+
     if (cfg.entities.pv_total) {
-      const [pvSegments, ratePoints] = await Promise.all([
-        fetchUsageSegments(this._hass, cfg.entities.pv_total, start, now),
-        fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now),
-      ]);
-      this._selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, ratePoints);
+      const pvSegments = await fetchUsageSegments(this._hass, cfg.entities.pv_total, start, now);
+      if (exportSegments) {
+        this._selfConsumed = splitSelfConsumedByExportMulti(pvSegments, exportSegments, holidays);
+      } else {
+        const ratePoints = await fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now);
+        this._selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, ratePoints, holidays);
+      }
     } else {
       this._selfConsumed = null;
     }
@@ -360,10 +602,26 @@ class MeaElectricBillCard extends HTMLElement {
     this._render();
   }
 
+  // Resolves the Ft (fuel adjustment) rate in baht/unit: prefers a live
+  // sensor (see README for the `scrape:` setup that reads PEA's published
+  // page) when it's present and holds a valid number, otherwise falls back
+  // to the manually configured ft_baht.
+  _resolveFt() {
+    const cfg = this._config;
+    if (cfg.ft_entity && this._hass) {
+      const state = this._hass.states[cfg.ft_entity];
+      if (state && state.state != null) {
+        const val = parseFloat(state.state);
+        if (!Number.isNaN(val)) return val;
+      }
+    }
+    return cfg.ft_baht;
+  }
+
   _calcBill() {
     const cfg = this._config;
     const vat = cfg.vat;
-    const ft = cfg.ft_satang / 100; // satang -> baht per unit
+    const ft = this._resolveFt(); // baht per unit
     let units;
     let energyCharge;
     let serviceCharge;
@@ -388,7 +646,8 @@ class MeaElectricBillCard extends HTMLElement {
         savingsEnergy = tieredEnergyCharge(units + selfConsumedUnits, rateSet.tiers) - energyCharge;
       }
     } else {
-      const rateSet = cfg.rates.tou || DEFAULT_RATES.tou;
+      const rateSet =
+        (cfg.rates.tou && cfg.rates.tou[cfg.tou_voltage_level]) || DEFAULT_RATES.tou[cfg.tou_voltage_level];
       const onPeak = (this._usage && this._usage.onPeak) || 0;
       const offPeak = (this._usage && this._usage.offPeak) || 0;
       units = onPeak + offPeak;
@@ -408,7 +667,7 @@ class MeaElectricBillCard extends HTMLElement {
 
     const ftCharge = units * ft;
     lines.push(["Service charge", serviceCharge]);
-    lines.push(["Ft adjustment", ftCharge]);
+    lines.push([`Ft adjustment (${ft.toFixed(4)} ฿/unit)`, ftCharge]);
     const subtotal = energyCharge + serviceCharge + ftCharge;
     const vatAmount = subtotal * (vat / 100);
     lines.push([`VAT (${vat}%)`, vatAmount]);
@@ -425,7 +684,21 @@ class MeaElectricBillCard extends HTMLElement {
       };
     }
 
-    return { units, lines, total, savings };
+    // Export (feed-in) revenue: flat-rate, not TOU-split, and NOT subject to
+    // VAT - it is income from PEA's buy-back programme, not an avoided cost,
+    // and must never be netted into "Estimated total" (which stays exactly
+    // what PEA bills you). Only shown when the user has explicitly opted in
+    // via show_export, since the buy-back only pays registered participants.
+    let exportRevenue = null;
+    if (cfg.show_export && this._exportUnits != null) {
+      exportRevenue = {
+        units: this._exportUnits,
+        total: this._exportUnits * cfg.export_rate,
+      };
+    }
+    const netCost = exportRevenue != null ? total - exportRevenue.total : null;
+
+    return { units, lines, total, savings, exportRevenue, netCost };
   }
 
   _render() {
@@ -459,6 +732,21 @@ class MeaElectricBillCard extends HTMLElement {
         </div>`
       : "";
 
+    const exportBlock = bill.exportRevenue
+      ? `<div class="export">
+          <span>⚡ Exported to grid (${bill.exportRevenue.units.toFixed(2)} units)</span>
+          <span class="num">+${bill.exportRevenue.total.toFixed(2)} ฿</span>
+        </div>`
+      : "";
+
+    const netCostRow =
+      bill.netCost != null
+        ? `<div class="net-cost">
+            <span>Net cost (after export)</span>
+            <span class="num">${bill.netCost.toFixed(2)} ฿</span>
+          </div>`
+        : "";
+
     this.shadowRoot.innerHTML = `
       <style>
         ha-card { padding: 16px; }
@@ -483,6 +771,24 @@ class MeaElectricBillCard extends HTMLElement {
           border-top: 1px dashed var(--divider-color);
           font-size: 0.9em;
           color: var(--success-color, #4caf50);
+        }
+        .export {
+          display: flex;
+          justify-content: space-between;
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed var(--divider-color);
+          font-size: 0.9em;
+          color: var(--info-color, #2196f3);
+        }
+        .net-cost {
+          display: flex;
+          justify-content: space-between;
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px solid var(--divider-color);
+          font-size: 0.95em;
+          font-weight: bold;
         }
         .tabs { display: flex; gap: 4px; margin-bottom: 12px; }
         .tab {
@@ -514,6 +820,8 @@ class MeaElectricBillCard extends HTMLElement {
           <tr class="total-row"><td>Estimated total</td><td class="num">${bill.total.toFixed(2)} ฿</td></tr>
         </table>
         ${savingsBlock}
+        ${exportBlock}
+        ${netCostRow}
       </ha-card>
     `;
 
@@ -523,9 +831,9 @@ class MeaElectricBillCard extends HTMLElement {
   }
 }
 
-class MeaElectricBillCardEditor extends HTMLElement {
+class PeaElectricBillCardEditor extends HTMLElement {
   setConfig(config) {
-    this._config = { ...MeaElectricBillCard.getStubConfig(), ...config };
+    this._config = { ...PeaElectricBillCard.getStubConfig(), ...config };
     this._rates = structuredClone(DEFAULT_RATES);
     this._mergeRates(config.rates);
     this._render();
@@ -552,7 +860,10 @@ class MeaElectricBillCardEditor extends HTMLElement {
       }
     }
     if (rates.tou) {
-      Object.assign(this._rates.tou, rates.tou);
+      for (const level of Object.keys(rates.tou)) {
+        if (!this._rates.tou[level]) continue;
+        Object.assign(this._rates.tou[level], rates.tou[level]);
+      }
     }
   }
 
@@ -593,7 +904,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
     const cfg = this._config;
     const isTou = cfg.scheme === "tou";
     const normalRates = this._rates.normal[cfg.tariff_class];
-    const touRates = this._rates.tou;
+    const touRates = this._rates.tou[cfg.tou_voltage_level];
 
     const ratesSection = !isTou
       ? `
@@ -618,7 +929,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
         </div>`
       : `
         <div class="rates-box">
-          <div class="rates-title">TOU rates</div>
+          <div class="rates-title">TOU rates (${touRates.label})</div>
           <div class="two-col">
             <div class="row">
               <label>Service charge (฿/month)</label>
@@ -645,6 +956,8 @@ class MeaElectricBillCardEditor extends HTMLElement {
         .two-col { display: flex; gap: 12px; }
         .two-col .row { flex: 1; }
         .row.hint { font-size: 0.8em; color: var(--secondary-text-color); margin-top: -4px; }
+        .row.checkbox-row { flex-direction: row; align-items: center; gap: 8px; }
+        .row.checkbox-row label { font-size: 0.9em; color: var(--primary-text-color); }
         .entity-row { display: flex; gap: 6px; margin-bottom: 6px; }
         .entity-row input { flex: 1; }
         .remove-total {
@@ -702,11 +1015,17 @@ class MeaElectricBillCardEditor extends HTMLElement {
           ? `<div class="row">
               <label>Tariff class</label>
               <select id="tariff_class">
-                <option value="1.1" ${cfg.tariff_class === "1.1" ? "selected" : ""}>1.1 - ≤150 units/month</option>
-                <option value="1.2" ${cfg.tariff_class === "1.2" ? "selected" : ""}>1.2 - &gt;150 units/month</option>
+                <option value="1.1.1" ${cfg.tariff_class === "1.1.1" ? "selected" : ""}>1.1.1 - ≤150 units/month</option>
+                <option value="1.1.2" ${cfg.tariff_class === "1.1.2" ? "selected" : ""}>1.1.2 - &gt;150 units/month</option>
               </select>
             </div>`
-          : ""
+          : `<div class="row">
+              <label>TOU voltage level</label>
+              <select id="tou_voltage_level">
+                <option value="1.2.2" ${cfg.tou_voltage_level === "1.2.2" ? "selected" : ""}>1.2.2 - below 22 kV (most households)</option>
+                <option value="1.2.1" ${cfg.tou_voltage_level === "1.2.1" ? "selected" : ""}>1.2.1 - 22-33 kV</option>
+              </select>
+            </div>`
       }
       <div class="row">
         <label>Total energy sensor(s) (cumulative kWh)</label>
@@ -724,7 +1043,19 @@ class MeaElectricBillCardEditor extends HTMLElement {
       </div>
       ${
         isTou
-          ? `<div class="row hint">On-peak/off-peak usage is split automatically from this single sensor based on time of day and day of week (Mon-Fri 09:00-22:00 = on-peak).</div>`
+          ? `<div class="row hint">On-peak/off-peak usage is split automatically from this single sensor based on time of day and day of week (Mon-Fri 09:00-22:00 = on-peak). Set a holiday calendar below for accurate off-peak billing on Thai public holidays.</div>`
+          : ""
+      }
+      ${
+        isTou
+          ? `<div class="row">
+              <label>Holiday calendar (optional, calendar.* entity)</label>
+              <input id="holiday_calendar" type="text" list="calendar-options" value="${cfg.holiday_calendar || ""}" placeholder="calendar.thailand_holidays" />
+            </div>
+            <div class="row">
+              <label>Extra off-peak dates (optional, comma-separated YYYY-MM-DD)</label>
+              <input id="holiday_dates" type="text" value="${(cfg.holiday_dates || []).join(", ")}" placeholder="2026-04-13, 2026-04-14" />
+            </div>`
           : ""
       }
       <div class="row">
@@ -732,22 +1063,48 @@ class MeaElectricBillCardEditor extends HTMLElement {
         <input id="entity_pv_total" type="text" list="sensor-options" value="${cfg.entities.pv_total || ""}" placeholder="sensor.your_pv_energy_total" />
       </div>
       <div class="row">
-        <label>PV self consumption rate sensor (optional, %)</label>
+        <label>PV export/sold sensor (optional, cumulative kWh - preferred over the % rate below)</label>
+        <input id="entity_pv_export_total" type="text" list="sensor-options" value="${cfg.entities.pv_export_total || ""}" placeholder="sensor.your_electricity_sold_total" />
+      </div>
+      <div class="row">
+        <label>PV self consumption rate sensor (optional, %, fallback if no export sensor is set)</label>
         <input id="entity_pv_self_consumption_rate" type="text" list="sensor-options" value="${cfg.entities.pv_self_consumption_rate || ""}" placeholder="sensor.your_pv_self_consumption_rate" />
       </div>
       <datalist id="sensor-options">
         ${this._sensorOptions()}
       </datalist>
-      <div class="row hint">If set, the card shows how much these saved you (PV Energy Total × Self Consumption Rate, valued at the on/off-peak time it was generated).</div>
+      <datalist id="calendar-options">
+        ${this._calendarOptions()}
+      </datalist>
+      <div class="row hint">If a PV sensor is set, the card shows how much self-consumed solar saved you, valued at the on/off-peak time it was generated.</div>
+      ${
+        cfg.entities.pv_export_total
+          ? `<div class="two-col">
+              <div class="row">
+                <label>Export buy-back rate (฿/unit)</label>
+                <input id="export_rate" type="number" step="0.01" value="${cfg.export_rate}" />
+              </div>
+              <div class="row checkbox-row">
+                <input id="show_export" type="checkbox" ${cfg.show_export ? "checked" : ""} />
+                <label for="show_export">Show export revenue</label>
+              </div>
+            </div>
+            <div class="row hint">Only enable this if you are registered in PEA's solar buy-back programme with an approved export meter - otherwise this shows income you don't actually receive.</div>`
+          : ""
+      }
       <div class="two-col">
         <div class="row">
-          <label>Ft adjustment (satang/unit)</label>
-          <input id="ft_satang" type="number" step="0.01" value="${cfg.ft_satang}" />
+          <label>Ft adjustment (฿/unit)</label>
+          <input id="ft_baht" type="number" step="0.0001" value="${cfg.ft_baht}" />
         </div>
         <div class="row">
           <label>VAT (%)</label>
           <input id="vat" type="number" step="0.1" value="${cfg.vat}" />
         </div>
+      </div>
+      <div class="row">
+        <label>Ft sensor (optional, ฿/unit - overrides the manual value above when available)</label>
+        <input id="entity_ft" type="text" list="sensor-options" value="${cfg.ft_entity || ""}" placeholder="sensor.pea_ft_rate" />
       </div>
       ${ratesSection}
     `;
@@ -762,8 +1119,8 @@ class MeaElectricBillCardEditor extends HTMLElement {
     $("default_period").addEventListener("change", (e) =>
       this._valueChanged(["default_period"], e.target.value)
     );
-    $("ft_satang").addEventListener("change", (e) =>
-      this._valueChanged(["ft_satang"], Number(e.target.value))
+    $("ft_baht").addEventListener("change", (e) =>
+      this._valueChanged(["ft_baht"], Number(e.target.value))
     );
     $("vat").addEventListener("change", (e) => this._valueChanged(["vat"], Number(e.target.value)));
 
@@ -783,18 +1140,54 @@ class MeaElectricBillCardEditor extends HTMLElement {
         );
       });
     } else {
+      $("tou_voltage_level").addEventListener("change", (e) =>
+        this._valueChanged(["tou_voltage_level"], e.target.value)
+      );
       $("tou_service_charge").addEventListener("change", (e) =>
-        this._rateChanged(["tou", "serviceCharge"], Number(e.target.value))
+        this._rateChanged(["tou", cfg.tou_voltage_level, "serviceCharge"], Number(e.target.value))
       );
       $("tou_on_peak_rate").addEventListener("change", (e) =>
-        this._rateChanged(["tou", "onPeakRate"], Number(e.target.value))
+        this._rateChanged(["tou", cfg.tou_voltage_level, "onPeakRate"], Number(e.target.value))
       );
       $("tou_off_peak_rate").addEventListener("change", (e) =>
-        this._rateChanged(["tou", "offPeakRate"], Number(e.target.value))
+        this._rateChanged(["tou", cfg.tou_voltage_level, "offPeakRate"], Number(e.target.value))
+      );
+      const holidayCalField = $("holiday_calendar");
+      if (holidayCalField) {
+        holidayCalField.addEventListener("change", (e) =>
+          this._valueChanged(["holiday_calendar"], e.target.value)
+        );
+      }
+      const holidayDatesField = $("holiday_dates");
+      if (holidayDatesField) {
+        holidayDatesField.addEventListener("change", (e) => {
+          const list = e.target.value
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean);
+          this._valueChanged(["holiday_dates"], list);
+        });
+      }
+    }
+
+    const entityFT = $("entity_ft");
+    if (entityFT) {
+      entityFT.addEventListener("change", (e) => this._valueChanged(["ft_entity"], e.target.value));
+    }
+    const exportRateField = $("export_rate");
+    if (exportRateField) {
+      exportRateField.addEventListener("change", (e) =>
+        this._valueChanged(["export_rate"], Number(e.target.value))
       );
     }
+    const showExportField = $("show_export");
+    if (showExportField) {
+      showExportField.addEventListener("change", (e) => this._valueChanged(["show_export"], e.target.checked));
+    }
+
     const entityFields = [
       ["entity_pv_total", "pv_total"],
+      ["entity_pv_export_total", "pv_export_total"],
       ["entity_pv_self_consumption_rate", "pv_self_consumption_rate"],
     ];
     for (const [elemId, key] of entityFields) {
@@ -845,15 +1238,24 @@ class MeaElectricBillCardEditor extends HTMLElement {
       .map((id) => `<option value="${id}"></option>`)
       .join("");
   }
+
+  _calendarOptions() {
+    if (!this._hass) return "";
+    return Object.keys(this._hass.states)
+      .filter((id) => id.startsWith("calendar."))
+      .sort()
+      .map((id) => `<option value="${id}"></option>`)
+      .join("");
+  }
 }
 
-customElements.define("mea-electric-bill-card", MeaElectricBillCard);
-customElements.define("mea-electric-bill-card-editor", MeaElectricBillCardEditor);
+customElements.define("pea-electric-bill-card", PeaElectricBillCard);
+customElements.define("pea-electric-bill-card-editor", PeaElectricBillCardEditor);
 
 window.customCards = window.customCards || [];
 window.customCards.push({
-  type: "mea-electric-bill-card",
-  name: "MEA Electric Bill Card",
+  type: "pea-electric-bill-card",
+  name: "PEA Electric Bill Card",
   description:
-    "Estimate your MEA (Metropolitan Electricity Authority) electric bill from energy sensors, supporting Normal (tiered) and TOU rate schemes with a custom billing cutoff day.",
+    "Estimate your PEA (Provincial Electricity Authority) electric bill from energy sensors, supporting Normal (tiered) and TOU (voltage-level-split) rate schemes, a custom billing cutoff day, an auto-updating Ft sensor, Thai holiday-aware TOU billing, and solar export revenue.",
 });
