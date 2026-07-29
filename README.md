@@ -52,18 +52,50 @@ buy-back (export) revenue.
   you, as a separate line from your bill and from your self-consumption
   savings.
 
-## Installation (HACS)
+## Installation
 
-1. In HACS, add this repository as a custom repository (category: "Lovelace").
-2. Install **PEA Electric Bill Card**.
-3. Add the resource if it isn't added automatically:
-   `Settings → Dashboards → Resources → /hacsfiles/hass-pea-electric-bill/pea-electric-bill-card.js` (JavaScript Module).
+### Via HACS (recommended)
 
-   > If you previously installed the MEA-forked version of this card, the
-   > resource path has changed (the filename is now `pea-electric-bill-card.js`,
-   > not `mea-electric-bill-card.js`). Update the resource or the card will
-   > render blank.
-4. Add the card to a dashboard, either via the visual editor or YAML.
+1. Make sure [HACS](https://hacs.xyz/) is installed on your Home Assistant instance.
+2. In Home Assistant, open **HACS** from the sidebar.
+3. Click the **⋮** (three-dot) menu in the top right corner → **Custom repositories**.
+4. In the dialog, paste this repository's URL:
+   `https://github.com/mrkaqz/hass-pea-electric-bill`, set **Category** to
+   **Lovelace**, then click **Add**.
+5. Close the dialog. Search for **PEA Electric Bill Card** inside HACS
+   (Frontend section) and open it.
+6. Click **Download**, confirm the version, and download it.
+7. **Register the Lovelace resource.** Recent HACS versions add this
+   automatically. If the card isn't available when you try to add it to a
+   dashboard, add the resource manually:
+   - **Settings → Dashboards → ⋮ (top right) → Resources → + Add Resource**
+   - URL: `/hacsfiles/hass-pea-electric-bill/pea-electric-bill-card.js`
+   - Resource type: **JavaScript Module**
+8. **Hard-refresh your browser** (Ctrl+F5 on Windows/Linux, Cmd+Shift+R on
+   Mac) so it loads the new resource instead of a cached copy, then reload
+   the dashboard.
+9. Edit a dashboard → **Add Card** → search for **PEA Electric Bill Card** to
+   use the visual editor, or add a manual card with
+   `type: custom:pea-electric-bill-card` and configure it using the examples
+   below.
+
+> **Upgrading from the old MEA-forked card?** The resource path has changed —
+> the filename is now `pea-electric-bill-card.js`, not
+> `mea-electric-bill-card.js`. Remove the old resource entry and add the new
+> one (step 7), or the card will render blank. Existing card configs using
+> the old MEA-style `tariff_class` (`"1.1"`/`"1.2"`) or `ft_satang` values
+> keep working — they're migrated automatically (see the
+> [configuration reference](#all-configuration-options) below).
+
+### Manual installation (without HACS)
+
+1. Copy `pea-electric-bill-card.js` from this repository into your Home
+   Assistant `config/www/` folder.
+2. Add the resource: **Settings → Dashboards → ⋮ → Resources → + Add
+   Resource**, URL `/local/pea-electric-bill-card.js`, type **JavaScript
+   Module**.
+3. Hard-refresh your browser, then add the card to a dashboard as in step 9
+   above.
 
 ## Configuration
 
@@ -114,6 +146,40 @@ holiday_dates: []                              # optional, extra static YYYY-MM-
 On-peak/off-peak split is derived automatically from the timestamps of the
 sensor's history (Mon-Fri 09:00-22:00 = on-peak; nights and all day Sat/Sun =
 off-peak, unless overridden by a holiday — see below).
+
+### All configuration options
+
+Every option this card reads, in one place. Sections further down go into
+more detail on the non-trivial ones (Ft, holidays, solar).
+
+| Option | Type | Default | Notes |
+|---|---|---|---|
+| `type` | string | — | Always `custom:pea-electric-bill-card` |
+| `name` | string | `"Electric Bill"` | Card title |
+| `scheme` | string | `"normal"` | `"normal"` (tiered) or `"tou"` (time-of-use) |
+| `tariff_class` | string | `"1.1.2"` | **Normal scheme only.** `"1.1.1"` (≤150 units/month) or `"1.1.2"` (>150 units/month). Legacy MEA-fork values `"1.1"`/`"1.2"` are migrated automatically. |
+| `tou_voltage_level` | string | `"1.2.2"` | **TOU scheme only.** `"1.2.2"` (below 22 kV, virtually all households) or `"1.2.1"` (22–33 kV) |
+| `cutoff_day` | number | `1` | Day of month (1–31) your PEA bill cycle resets |
+| `default_period` | string | `"cycle"` | Which tab is selected on load: `"day"`, `"week"`, `"month"`, or `"cycle"` |
+| `vat` | number | `7` | VAT percentage applied to the subtotal |
+| `ft_baht` | number | `0.1623` | Manual Ft adjustment, **baht/unit**. Ignored whenever `ft_entity` resolves to a valid number. A legacy MEA-fork `ft_satang` value (satang/unit) is migrated automatically if present and `ft_baht` is not set. |
+| `ft_entity` | string | — | Optional sensor providing Ft in baht/unit; see [Auto-updating Ft](#auto-updating-ft) |
+| `holiday_calendar` | string | — | Optional `calendar.*` entity for TOU holiday billing; see [Holiday-aware TOU billing](#holiday-aware-tou-billing). TOU only. |
+| `holiday_dates` | list of `"YYYY-MM-DD"` strings | `[]` | Optional static off-peak dates, in addition to (or instead of) `holiday_calendar`. TOU only. |
+| `holiday_onpeak_keywords` | map | `{ ploughing: [...], compensatory: [...] }` | Optional override of the keyword lists used to classify `holiday_calendar` events. TOU only. |
+| `export_rate` | number | `2.20` | PEA solar buy-back rate, baht/unit |
+| `show_export` | boolean | `false` | Show the export-revenue line; only turn on if you're registered in PEA's buy-back programme |
+| `entities` | map | — | See table below |
+| `rates` | map | — | Optional override of the built-in tariff figures; see [Overriding rates](#overriding-rates) |
+
+`entities` sub-options:
+
+| Key | Required | Description |
+|---|---|---|
+| `entities.total` | **yes** | Cumulative grid-import kWh sensor. Also accepts a list of sensors (summed together) if you have multiple meters. |
+| `entities.pv_total` | no | Cumulative PV production kWh sensor |
+| `entities.pv_export_total` | no | Cumulative "electricity sold" / export kWh sensor — preferred source for both self-consumption savings and export revenue |
+| `entities.pv_self_consumption_rate` | no | Self-consumption rate (%) sensor — fallback only, used if `pv_export_total` isn't set |
 
 ## Rates
 
