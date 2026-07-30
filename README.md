@@ -16,6 +16,8 @@ buy-back (export) revenue.
 > service charge for a normal household (24.62 ฿) is not the same figure MEA
 > uses (38.22 ฿). See [Rates](#rates) below.
 
+<img src="images/card-preview.jpg" alt="PEA Electric Bill Card showing a TOU bill cycle with on-peak/off-peak usage, service charge, Ft adjustment, VAT, solar self-consumption savings, export revenue, and net cost" width="420" />
+
 ## Features
 
 - **Normal (tiered / bucket) rate** — select a single cumulative energy sensor
