@@ -38,6 +38,7 @@ const DEFAULT_RATES = {
 };
 
 const VAT_DEFAULT = 7;
+const EXPORT_RATE_DEFAULT = 2.20; // ฿/kWh, residential solar buyback
 
 function tieredEnergyCharge(units, tiers) {
   let remaining = Math.max(0, units);
@@ -111,7 +112,7 @@ async function fetchSeries(hass, entityId, start, end) {
       time: new Date(p.last_changed),
       value: parseFloat(p.state),
     }))
-    .filter((p) => !Number.isNaN(p.value))
+    .filter((p) => Number.isFinite(p.value))
     .sort((a, b) => a.time - b.time);
 }
 
@@ -119,7 +120,7 @@ async function fetchSeries(hass, entityId, start, end) {
 // indefinitely at hourly resolution, unlike raw history which is typically
 // purged after ~10 days. The "sum" stat already compensates for meter
 // resets, so it's the more robust source whenever it's available.
-async function fetchStatPoints(hass, entityId, start, end) {
+async function fetchStatPoints(hass, entityId, start, end, type = "sum") {
   if (!entityId) return [];
   let result;
   try {
@@ -129,15 +130,15 @@ async function fetchStatPoints(hass, entityId, start, end) {
       end_time: end.toISOString(),
       statistic_ids: [entityId],
       period: "hour",
-      types: ["sum"],
+      types: [type],
     });
   } catch (err) {
     return [];
   }
   const series = (result && result[entityId]) || [];
   return series
-    .filter((p) => p.sum != null)
-    .map((p) => ({ time: new Date(p.start), end: new Date(p.end), value: p.sum }))
+    .filter((p) => Number.isFinite(p[type]))
+    .map((p) => ({ time: new Date(p.start), end: new Date(p.end), value: p[type] }))
     .sort((a, b) => a.time - b.time);
 }
 
@@ -157,6 +158,23 @@ async function fetchUsageSegments(hass, entityId, start, end) {
   if (statPoints.length) segments.push(statPoints);
   if (tailPoints.length) segments.push(tailPoints);
   return segments;
+}
+
+async function fetchExportedEnergy(hass, entityId, start, end) {
+  // Recorder's hourly changes include the first hour's growth and account for resets.
+  const hourly = (await fetchStatPoints(hass, entityId, start, end, "change"))
+    .filter((point) => point.time >= start && point.end <= end);
+  const tailStart = hourly.at(-1)?.end ?? start;
+  const history = await fetchSeries(hass, entityId, tailStart, end);
+  if (!hourly.length && !history.length) return null;
+
+  let exported = hourly.reduce((sum, point) => sum + point.value, 0);
+  for (let i = 1; i < history.length; i++) {
+    const current = history[i].value;
+    const delta = current - history[i - 1].value;
+    exported += delta < 0 ? current : delta;
+  }
+  return Math.max(0, exported);
 }
 
 function totalUsageMulti(segments) {
@@ -264,6 +282,7 @@ class MeaElectricBillCard extends HTMLElement {
       cutoff_day: 1,
       ft_satang: 0,
       vat: VAT_DEFAULT,
+      export_rate: EXPORT_RATE_DEFAULT,
       default_period: "cycle",
       entities: {},
     };
@@ -283,6 +302,10 @@ class MeaElectricBillCard extends HTMLElement {
     if (cutoffDay < 1 || cutoffDay > 31) {
       throw new Error("cutoff_day must be between 1 and 31");
     }
+    const exportRate = Number(config.export_rate ?? EXPORT_RATE_DEFAULT);
+    if (!Number.isFinite(exportRate) || exportRate < 0) {
+      throw new Error("export_rate must be a non-negative number in ฿/kWh");
+    }
     const defaultPeriod = PERIODS[config.default_period] ? config.default_period : "cycle";
     this._config = {
       name: config.name || "Electric Bill",
@@ -291,10 +314,13 @@ class MeaElectricBillCard extends HTMLElement {
       cutoff_day: cutoffDay,
       ft_satang: Number(config.ft_satang ?? 0),
       vat: Number(config.vat ?? VAT_DEFAULT),
+      export_rate: exportRate,
       entities,
       rates: config.rates || {},
     };
     if (!this._period) this._period = defaultPeriod;
+    this._usageRequest = null;
+    this._exportedUnits = undefined;
     this._lastFetch = 0;
     this._render();
   }
@@ -318,20 +344,32 @@ class MeaElectricBillCard extends HTMLElement {
   _setPeriod(period) {
     if (this._period === period) return;
     this._period = period;
-    this._lastFetch = 0;
+    this._lastFetch = Date.now();
+    this._cycleStart = null;
+    this._exportedUnits = undefined;
+    this._render();
     this._updateUsage();
   }
 
   async _updateUsage() {
     if (!this._hass || !this._config) return;
+    const request = Symbol();
+    this._usageRequest = request;
+    const hass = this._hass;
     const cfg = this._config;
     const now = new Date();
     const start = getPeriodStart(this._period || "cycle", cfg.cutoff_day, now);
 
-    const totalEntities = toArray(cfg.entities.total);
-    const segmentsPerEntity = await Promise.all(
-      totalEntities.map((id) => fetchUsageSegments(this._hass, id, start, now))
-    );
+    const [segmentsPerEntity, pvSegments, ratePoints, exportedUnits] = await Promise.all([
+      Promise.all(toArray(cfg.entities.total).map((id) => fetchUsageSegments(hass, id, start, now))),
+      fetchUsageSegments(hass, cfg.entities.pv_total, start, now),
+      cfg.entities.pv_total
+        ? fetchSeries(hass, cfg.entities.pv_self_consumption_rate, start, now)
+        : [],
+      cfg.entities.export ? fetchExportedEnergy(hass, cfg.entities.export, start, now) : null,
+    ]);
+    if (this._usageRequest !== request) return;
+
     if (cfg.scheme === "normal") {
       this._usage = {
         units: segmentsPerEntity.reduce((sum, segs) => sum + totalUsageMulti(segs), 0),
@@ -346,16 +384,10 @@ class MeaElectricBillCard extends HTMLElement {
       );
     }
 
-    if (cfg.entities.pv_total) {
-      const [pvSegments, ratePoints] = await Promise.all([
-        fetchUsageSegments(this._hass, cfg.entities.pv_total, start, now),
-        fetchSeries(this._hass, cfg.entities.pv_self_consumption_rate, start, now),
-      ]);
-      this._selfConsumed = splitSelfConsumedByPeakMulti(pvSegments, ratePoints);
-    } else {
-      this._selfConsumed = null;
-    }
-
+    this._selfConsumed = cfg.entities.pv_total
+      ? splitSelfConsumedByPeakMulti(pvSegments, ratePoints)
+      : null;
+    this._exportedUnits = exportedUnits;
     this._cycleStart = start;
     this._render();
   }
@@ -459,6 +491,23 @@ class MeaElectricBillCard extends HTMLElement {
         </div>`
       : "";
 
+    let exportBlock = "";
+    if (this._config.entities.export) {
+      const units = this._exportedUnits;
+      let label = "Estimated export revenue";
+      let value = "Loading…";
+      if (units === null) {
+        value = "No export data";
+      } else if (units !== undefined) {
+        label += ` (${units.toFixed(2)} kWh)`;
+        value = `${(units * this._config.export_rate).toFixed(2)} ฿`;
+      }
+      exportBlock = `<div class="savings">
+        <span>${label}</span>
+        <span class="num">${value}</span>
+      </div>`;
+    }
+
     this.shadowRoot.innerHTML = `
       <style>
         ha-card { padding: 16px; }
@@ -514,6 +563,7 @@ class MeaElectricBillCard extends HTMLElement {
           <tr class="total-row"><td>Estimated total</td><td class="num">${bill.total.toFixed(2)} ฿</td></tr>
         </table>
         ${savingsBlock}
+        ${exportBlock}
       </ha-card>
     `;
 
@@ -739,6 +789,14 @@ class MeaElectricBillCardEditor extends HTMLElement {
         ${this._sensorOptions()}
       </datalist>
       <div class="row hint">If set, the card shows how much these saved you (PV Energy Total × Self Consumption Rate, valued at the on/off-peak time it was generated).</div>
+      <div class="row">
+        <label for="entity_export">Grid export sensor (optional, cumulative kWh)</label>
+        <input id="entity_export" type="text" list="sensor-options" placeholder="sensor.your_grid_export_energy" />
+      </div>
+      ${cfg.entities.export ? `<div class="row">
+        <label for="export_rate">Export rate (฿/kWh)</label>
+        <input id="export_rate" type="number" min="0" step="any" />
+      </div>` : ""}
       <div class="two-col">
         <div class="row">
           <label>Ft adjustment (satang/unit)</label>
@@ -766,6 +824,17 @@ class MeaElectricBillCardEditor extends HTMLElement {
       this._valueChanged(["ft_satang"], Number(e.target.value))
     );
     $("vat").addEventListener("change", (e) => this._valueChanged(["vat"], Number(e.target.value)));
+
+    $("entity_export").value = cfg.entities.export || "";
+    const exportRate = $("export_rate");
+    if (exportRate) {
+      exportRate.value = cfg.export_rate ?? EXPORT_RATE_DEFAULT;
+      exportRate.addEventListener("change", (e) => {
+        const input = e.target;
+        if (!input.reportValidity()) return;
+        this._valueChanged(["export_rate"], input.value === "" ? EXPORT_RATE_DEFAULT : input.valueAsNumber);
+      });
+    }
 
     if (!isTou) {
       $("tariff_class").addEventListener("change", (e) =>
@@ -796,6 +865,7 @@ class MeaElectricBillCardEditor extends HTMLElement {
     const entityFields = [
       ["entity_pv_total", "pv_total"],
       ["entity_pv_self_consumption_rate", "pv_self_consumption_rate"],
+      ["entity_export", "export"],
     ];
     for (const [elemId, key] of entityFields) {
       const field = $(elemId);

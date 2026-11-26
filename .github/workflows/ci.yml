@@ -1,0 +1,26 @@
+name: CI
+
+on: [pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  card:
+    name: Card checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      TZ: Asia/Bangkok
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          package-manager-cache: false
+      - name: Check JavaScript syntax
+        run: node --check mea-electric-bill-card.js
+      - name: Run card tests
+        run: node --test
