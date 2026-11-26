@@ -26,6 +26,8 @@ MEA residential rate schemes and a per-user billing cutoff day.
   Consumption Rate sensor and the card shows how much the self-consumed solar
   energy (PV total × self-consumption rate) saved you, valued at the
   on/off-peak or tiered rate in effect when it was generated.
+- Optional grid export — use a dedicated export energy sensor to see the kWh
+  sent to the grid and the estimated revenue for the selected period.
 
 ## Installation (HACS)
 
@@ -49,7 +51,7 @@ default_period: cycle        # day | week | month | cycle (default tab shown)
 ft_satang: 0                 # current Ft adjustment, satang/unit (update each quarter)
 vat: 7
 entities:
-  total: sensor.atmoce_grid_energy_total   # cumulative kWh sensor
+  total: sensor.atmoce_grid_energy_total   # cumulative grid import (kWh)
   pv_total: sensor.atmoce_pv_energy_total                    # optional
   pv_self_consumption_rate: sensor.atmoce_pv_self_consumption_rate  # optional, %
 ```
@@ -74,13 +76,38 @@ cutoff_day: 5
 ft_satang: 0
 vat: 7
 entities:
-  total: sensor.atmoce_grid_energy_total   # same single cumulative kWh sensor
+  total: sensor.atmoce_grid_energy_total   # cumulative grid import (kWh)
 ```
 
 On-peak/off-peak split is derived automatically from the timestamps of the
 sensor's history (Mon-Fri 09:00-22:00 = on-peak; nights and all day Sat/Sun =
 off-peak). Thai public holidays (which MEA also bills as off-peak) aren't
 accounted for, since Home Assistant has no built-in Thai holiday calendar.
+
+### Grid export and solar buyback
+
+Add these settings to either tariff scheme, or set **Grid export sensor** and
+**Export rate** in the visual editor.
+
+```yaml
+export_rate: 2.20  # optional, defaults to ฿2.20/kWh
+entities:
+  total: sensor.your_grid_import_energy
+  export: sensor.your_grid_export_energy
+```
+
+Use a cumulative kWh sensor that measures energy delivered to the grid, such as
+the sensor configured as **Energy exported to grid** in Home Assistant. Export
+revenue equals exported kWh × `export_rate`. The card displays it separately
+from the estimated import bill and solar self-consumption savings. Usage is
+estimated from hourly Recorder statistics and recent sensor history.
+
+Thailand's 2569 (2026) residential rooftop solar buyback program pays
+**฿2.20/kWh for 10 years** for surplus energy delivered to the grid, with up to
+**5 kW AC** offered per meter. Apply through your utility, wait for selection,
+sign the power purchase agreement, and complete the utility's inspection and
+grid connection steps before starting commercial export.
+[MEA MyEnergy](https://myenergy.mea.or.th/?lang=th)
 
 ### Overriding rates
 
